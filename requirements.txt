@@ -1,0 +1,2 @@
+openpyxl
+websocket-client

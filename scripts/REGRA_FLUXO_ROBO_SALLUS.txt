@@ -1,0 +1,101 @@
+REGRA DO FLUXO DO ROBO SALLUS
+=============================
+
+O robo tera 2 etapas automatizadas.
+Entre elas existe uma pausa humana para preenchimento da planilha clinica.
+
+
+Etapa 1 do Robo: Baixar Fila Salus
+----------------------------------
+
+O robo entra no Salus, seleciona Sirio Libanes e gera:
+
+exports/pacientes_sirio_libanes_DATA.xlsx
+
+Essa planilha e a fila oficial do dia, com:
+
+- Nome
+- Iniciais
+- Senha
+- Dias internado
+
+Depois essa etapa termina.
+Nada e lancado ainda.
+
+
+Pausa Humana: Preparar Planilha Clinica
+---------------------------------------
+
+A partir da lista do Salus, teremos uma segunda planilha de trabalho, por exemplo:
+
+exports/preenchimento_evolucao_clinica_DATA.xlsx
+
+Nela, cada linha sera um paciente.
+
+Colunas principais:
+
+- Nome
+- Iniciais
+- Senha
+- Dias internado
+- depois todos os campos da evolucao clinica
+
+Essa planilha sera preenchida manualmente no Excel.
+Esse preenchimento pode demorar 1 a 2 horas.
+O robo fica parado nessa etapa.
+Essa etapa nao faz parte da automacao do robo.
+Ela e humana e independente da geracao da lista.
+
+
+Etapa 2 do Robo: Lancar Evolucao no Salus
+-----------------------------------------
+
+Regra detalhada desta etapa:
+
+scripts/REGRA_ETAPA_2_LANCAR_EVOLUCAO_SALUS.txt
+
+Depois que a planilha clinica estiver pronta, o robo:
+
+1. Abre a lista Salus.
+2. Pega a primeira senha.
+3. Procura essa senha na planilha clinica.
+4. Se encontrar:
+   - entra no paciente no Salus
+   - clica em visualizar
+   - clica em registrar evolucao clinica
+   - percorre as colunas preenchidas da linha
+   - preenche cada campo correspondente na tela
+   - salva/avanca conforme regra definida
+5. Se nao encontrar:
+   - pula
+   - registra no relatorio: senha nao encontrada na planilha clinica
+6. Repete ate acabar a lista do Salus.
+
+
+Chave de Busca
+--------------
+
+A chave principal sera:
+
+- Senha
+
+Nome e Iniciais ficam para conferencia e relatorio.
+
+
+Relatorio de Lancamentos
+------------------------
+
+O robo tambem deve gerar uma terceira saida:
+
+exports/relatorio_lancamentos_DATA.xlsx
+
+Com status por paciente:
+
+- Senha
+- Nome
+- Iniciais
+- Status
+- Mensagem
+- Data/hora
+- Campos preenchidos
+- Campos com erro

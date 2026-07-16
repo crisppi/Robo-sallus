@@ -1,0 +1,247 @@
+REGRA DA ETAPA 2 DO ROBO: LANCAR EVOLUCAO NO SALUS
+===================================================
+
+Objetivo
+--------
+
+Ler a fila oficial baixada do Salus e lancar a evolucao clinica paciente por
+paciente, usando a planilha clinica preenchida manualmente no Excel.
+
+O robo deve sempre usar a SENHA como chave principal de conferencia.
+
+Script desta etapa:
+
+scripts/etapa2_lancar_evolucao_salus.py
+
+Por seguranca, o script roda em modo dry-run por padrao. Nesse modo ele valida
+as planilhas e gera relatorio sem lancar nada no Salus.
+
+
+Arquivos de Entrada
+-------------------
+
+1. Fila oficial do Salus:
+
+   exports/pacientes_sirio_libanes_DATA.xlsx
+
+   Colunas esperadas:
+   - Nome
+   - Iniciais
+   - Senha
+   - Dias internado
+
+2. Planilha clinica preenchida:
+
+   exports/preenchimento_evolucao_clinica_DATA.xlsx
+
+   Colunas esperadas:
+   - Nome ou Nome paciente
+   - Iniciais
+   - Senha
+   - Dias internado
+   - depois todos os campos da evolucao clinica, um campo por coluna
+
+
+Arquivo de Saida
+----------------
+
+O robo deve gerar:
+
+exports/relatorio_lancamentos_DATA.xlsx
+
+Colunas do relatorio:
+- Senha
+- Nome
+- Iniciais
+- Status
+- Mensagem
+- Data/hora
+- Campos preenchidos
+- Campos ignorados
+- Campos com erro
+
+
+Regra Principal de Percurso
+---------------------------
+
+1. Abrir a fila oficial do Salus.
+2. Abrir a planilha clinica preenchida.
+3. Percorrer a fila oficial do Salus na ordem em que ela foi baixada.
+4. Para cada paciente da fila Salus:
+   - ler a Senha
+   - procurar a mesma Senha na planilha clinica
+   - conferir Nome e Iniciais quando existirem nas duas planilhas
+   - usar Nome e Iniciais apenas como conferencia
+   - a chave principal continua sendo Senha
+
+
+Quando a Senha Existe nas Duas Planilhas
+----------------------------------------
+
+Se a Senha da fila Salus for encontrada na planilha clinica:
+
+1. Entrar no paciente correspondente no Salus.
+2. Clicar em visualizar.
+3. Clicar em registrar evolucao clinica.
+4. Ler a linha da planilha clinica referente a essa Senha.
+5. Percorrer as colunas da planilha clinica da esquerda para a direita.
+6. Para cada coluna de campo clinico:
+   - se a celula estiver vazia, nao preencher e registrar como ignorada
+   - se a celula estiver preenchida, localizar o campo correspondente no Salus
+   - preencher o campo conforme o tipo
+   - registrar sucesso ou erro por campo
+7. Ao terminar os campos do paciente:
+   - salvar/avancar conforme a regra definida para a tela
+   - registrar o resultado no relatorio
+8. Voltar para a lista do Salus.
+9. Passar para o proximo paciente da fila Salus.
+
+
+Quando a Senha Nao Existe na Planilha Clinica
+---------------------------------------------
+
+Se a Senha da fila Salus nao for encontrada na planilha clinica:
+
+1. Nao entrar no paciente.
+2. Pular para o proximo paciente da fila Salus.
+3. Registrar no relatorio:
+   - Status: PULADO
+   - Mensagem: Senha nao encontrada na planilha clinica
+
+
+Quando a Senha Aparece Mais de Uma Vez na Planilha Clinica
+----------------------------------------------------------
+
+Se a mesma Senha aparecer em mais de uma linha da planilha clinica:
+
+1. Nao lancar esse paciente.
+2. Registrar no relatorio:
+   - Status: ERRO
+   - Mensagem: Senha duplicada na planilha clinica
+3. Passar para o proximo paciente da fila Salus.
+
+
+Conferencia de Nome e Iniciais
+------------------------------
+
+Para cada Senha encontrada, o robo deve conferir Nome e Iniciais.
+
+Se Nome ou Iniciais estiverem diferentes:
+
+1. Continuar usando a Senha como chave principal.
+2. Registrar alerta no relatorio:
+   - Status pode continuar como SUCESSO se o lancamento ocorrer
+   - Mensagem deve informar a divergencia encontrada
+
+Exemplo:
+
+Senha confere, mas Iniciais divergentes entre Salus e planilha clinica.
+
+
+Regra por Tipo de Campo
+-----------------------
+
+Campo texto:
+- copiar o valor da celula para o campo do Salus
+
+Campo data:
+- usar formato dd/mm/aaaa
+- se o Excel estiver com data real, converter para dd/mm/aaaa
+
+Campo numero:
+- preencher apenas se houver valor numerico
+
+Campo Sim/Nao:
+- aceitar apenas Sim ou Nao
+- clicar na opcao correspondente no Salus
+
+Campo select / combo / radio / escolha unica:
+- a celula deve conter um unico valor
+- o valor deve ser igual a uma opcao valida do Salus
+- selecionar a opcao correspondente
+
+Campo multipla escolha / checkbox:
+- a celula pode conter uma ou mais opcoes
+- quando houver mais de uma opcao, separar por ponto e virgula (;)
+- exemplo: Dor; Febre; Nauseas
+- o robo deve separar os valores por ;
+- marcar cada opcao correspondente no Salus
+
+Campo condicional:
+- preencher somente se a celula tiver valor
+- se a celula estiver vazia, nao acionar o campo
+- se o campo pai necessario nao estiver preenchido, registrar erro ou alerta
+
+
+Campos Vazios
+-------------
+
+Celula vazia significa:
+
+- nao preencher esse campo
+- nao apagar valor ja existente no Salus
+- registrar como campo ignorado, se necessario
+
+
+Campos com Erro
+---------------
+
+Se o robo nao conseguir preencher um campo:
+
+1. Registrar o nome da coluna.
+2. Registrar o motivo do erro.
+3. Continuar para o proximo campo sempre que for seguro.
+4. Se o erro impedir continuar a tela, parar o paciente, salvar o status no
+   relatorio e passar para o proximo paciente somente se for seguro.
+
+
+Final de Cada Paciente
+----------------------
+
+Ao terminar a linha do paciente:
+
+1. Conferir se todos os campos preenchidos na planilha foram tentados.
+2. Salvar/avancar no Salus conforme regra definida para a tela.
+3. Registrar no relatorio:
+   - SUCESSO, se tudo foi preenchido
+   - SUCESSO_COM_ALERTA, se houve divergencia de conferencia ou campo ignorado esperado
+   - ERRO, se houve falha relevante
+   - PULADO, se a Senha nao estava na planilha clinica
+
+
+Retomada em Caso de Interrupcao
+-------------------------------
+
+O relatorio de lancamentos deve permitir retomar o processo.
+
+Antes de lancar um paciente, o robo deve verificar se aquela Senha ja consta no
+relatorio com Status SUCESSO.
+
+Se ja constar como SUCESSO:
+
+- pular esse paciente
+- nao lancar novamente
+
+Se constar como ERRO ou PULADO:
+
+- pode tentar novamente somente se a regra de retomada permitir
+
+
+Resumo da Logica
+----------------
+
+Para cada paciente na fila Salus:
+
+1. Pegar Senha da fila Salus.
+2. Procurar a mesma Senha na planilha clinica.
+3. Se nao encontrar, pular e registrar.
+4. Se duplicada, pular e registrar erro.
+5. Se encontrar uma unica linha:
+   - conferir Nome e Iniciais
+   - abrir paciente no Salus
+   - registrar evolucao clinica
+   - percorrer cada coluna preenchida
+   - preencher campo a campo
+   - salvar/avancar
+   - registrar resultado
+6. Ir para a proxima Senha ate terminar a fila Salus.
