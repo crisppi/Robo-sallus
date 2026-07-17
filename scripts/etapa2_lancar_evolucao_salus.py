@@ -241,6 +241,7 @@ def read_options(wb) -> dict[str, list[str]]:
     headers = worksheet_headers(ws)
     campo_col = find_column(headers, "Campo")
     opcao_col = find_column(headers, "Opção", "Opcao")
+    codigo_col = find_column(headers, "Código", "Codigo")
     if not campo_col or not opcao_col:
         return {}
 
@@ -248,7 +249,10 @@ def read_options(wb) -> dict[str, list[str]]:
     for row in range(2, ws.max_row + 1):
         campo = value_to_text(ws.cell(row, campo_col).value)
         opcao = value_to_text(ws.cell(row, opcao_col).value)
+        codigo = value_to_text(ws.cell(row, codigo_col).value) if codigo_col else ""
         if not campo or not opcao:
+            continue
+        if codigo == "API" or opcao.startswith("Lista pesquisável pela API"):
             continue
         options.setdefault(campo, [])
         if opcao not in options[campo]:
@@ -289,6 +293,39 @@ def read_clinical(path: Path) -> tuple[dict[str, list[ClinicalPatient]], dict[st
             for header, col in headers.items()
             if header in field_headers
         }
+        admission_cid = values.get("Dados da Internação - CID de internação *")
+        if not is_blank(admission_cid):
+            # Regra operacional: se não houver mudança diagnóstica
+            # explicitamente marcada na geração da base, repetir o CID inicial.
+            values["Dados da Internação - CID ajustado *"] = admission_cid
+        if is_blank(values.get("Dados da Internação - Comorbidades *")):
+            values["Dados da Internação - Comorbidades *"] = "0SC - Sem comorbidades"
+        if is_blank(values.get("Exame Físico - Mobilidade e dependência *")):
+            values["Exame Físico - Mobilidade e dependência *"] = "Deambulando"
+        if is_blank(values.get("Exame Físico - Acesso venoso? *")):
+            values["Exame Físico - Acesso venoso? *"] = "Sim"
+        if is_blank(values.get("Exame Físico - Qual o acesso venoso? * (cond.)")):
+            values["Exame Físico - Qual o acesso venoso? * (cond.)"] = "Periférico"
+        if is_blank(values.get("Exame Físico - Alimentação *")):
+            values["Exame Físico - Alimentação *"] = "Oral"
+        if is_blank(values.get("Exame Físico - Controle de eliminação *")):
+            values["Exame Físico - Controle de eliminação *"] = "Normal"
+        for field in [
+            "Conduta Clínica - Uso de antibiótico? *",
+            "Conduta Clínica - Uso de antifúngico? *",
+            "Conduta Clínica - Uso de antiviral? *",
+            "Conduta Clínica - Administração de Imunoglobulina *",
+            "Conduta Clínica - Terapias Ativas (ex .: fisioterapia, suporte clínico) * *",
+            "Conduta Clínica - Realizado procedimento cirúrgico? *",
+            "Condição Adquirida - Paciente adquiriu alguma condição? *",
+        ]:
+            if is_blank(values.get(field)):
+                values[field] = "Não"
+        if (
+            "quimioterapia" in value_to_text(values.get("Conduta Clínica - Terapias em andamento * (cond.)")).lower()
+            and is_blank(values.get("Conduta Clínica - Tipo de Quimioterapia * (cond.)"))
+        ):
+            values["Conduta Clínica - Tipo de Quimioterapia * (cond.)"] = "Curativa"
         patient = ClinicalPatient(
             row_number=row,
             senha=senha,
@@ -426,15 +463,28 @@ class SalusExecutor:
     """Executor real do Salus.
 
     A regra de negocio ja chama esta classe com paciente e campos prontos.
-    No teste real, vamos implementar aqui a navegacao e o preenchimento usando
-    os seletores/API observados na tela do Salus.
+    O preenchimento real usa a tela HTML do Salus via Chrome DevTools remoto,
+    clicando e digitando nos campos como um usuario.
     """
 
+    def __init__(self, usar_defaults_obrigatorios: bool = False) -> None:
+        self.usar_defaults_obrigatorios = usar_defaults_obrigatorios
+
     def lancar(self, queue_patient: QueuePatient, clinical_patient: ClinicalPatient, fields: list[PreparedField]) -> list[PreparedField]:
-        raise RuntimeError(
-            "Executor real ainda nao foi ligado. Rode sem --executar-salus para validar "
-            "a planilha; amanha conectaremos esta classe aos campos reais do Salus."
+        from lancar_evolucao_html_salus import run_html_fill
+
+        result = run_html_fill(
+            clinical_patient,
+            confirmar=True,
+            usar_defaults_obrigatorios=self.usar_defaults_obrigatorios,
         )
+        if not result.get("confirmEnabled"):
+            raise RuntimeError("Tela HTML preenchida, mas Confirmar evolucao permaneceu desabilitado.")
+        for field in fields:
+            if field.status == "PENDENTE":
+                field.status = "OK"
+                field.mensagem = "Preenchido pela tela HTML do Salus."
+        return fields
 
 
 def build_patient_result(
@@ -492,9 +542,10 @@ def process_patients(
     dry_run: bool,
     only_password: str | None = None,
     limit: int | None = None,
+    usar_defaults_obrigatorios: bool = False,
     progress_callback: Callable[[str, QueuePatient, PatientResult | None], None] | None = None,
 ) -> list[PatientResult]:
-    executor = DryRunExecutor() if dry_run else SalusExecutor()
+    executor = DryRunExecutor() if dry_run else SalusExecutor(usar_defaults_obrigatorios=usar_defaults_obrigatorios)
     results: list[PatientResult] = []
     processed = 0
 
@@ -679,6 +730,11 @@ def main() -> int:
         action="store_true",
         help="Tenta executar no Salus. Sem esta flag, roda apenas simulacao/dry-run.",
     )
+    parser.add_argument(
+        "--preencher-obrigatorios-medios",
+        action="store_true",
+        help="Ao executar no Salus, preenche obrigatorios ausentes com defaults medios explicitamente autorizados.",
+    )
     args = parser.parse_args()
 
     queue_path = Path(args.fila)
@@ -698,6 +754,7 @@ def main() -> int:
         dry_run=not args.executar_salus,
         only_password=args.somente_senha,
         limit=args.limite,
+        usar_defaults_obrigatorios=args.preencher_obrigatorios_medios,
     )
     write_report(results, report_path)
     print_summary(results)

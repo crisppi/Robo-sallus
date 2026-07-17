@@ -38,8 +38,13 @@ HOST = "127.0.0.1"
 PORT = 8765
 
 
-def newest(pattern: str, fallback: str) -> Path:
-    matches = sorted(EXPORTS.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+def newest(patterns: str | tuple[str, ...], fallback: str) -> Path:
+    if isinstance(patterns, str):
+        patterns = (patterns,)
+    matches = []
+    for pattern in patterns:
+        matches.extend(EXPORTS.glob(pattern))
+    matches = sorted(set(matches), key=lambda p: p.stat().st_mtime, reverse=True)
     return matches[0] if matches else EXPORTS / fallback
 
 
@@ -52,9 +57,9 @@ def default_state() -> dict:
         "processed_now": 0,
         "logs": [],
         "files": {
-            "fila": str(newest("pacientes_sirio_libanes_*.xlsx", "pacientes_sirio_libanes_DATA.xlsx")),
-            "clinica": str(newest("preenchimento_evolucao_clinica_*_colorido.xlsx", "preenchimento_evolucao_clinica_DATA.xlsx")),
-            "relatorio": str(EXPORTS / f"relatorio_lancamentos_{dt.date.today().isoformat()}.xlsx"),
+            "fila": str(newest(("fila_salus_*.xlsx", "pacientes_sirio_libanes_*.xlsx"), "fila_salus_DATA.xlsx")),
+            "clinica": str(newest(("data_base_lancamento_*.xlsx", "data_base_lantamento_*.xlsx", "preenchimento_evolucao_clinica_*_colorido.xlsx"), "data_base_lancamento_DATA.xlsx")),
+            "relatorio": str(EXPORTS / "data_base_lancamento_16_07_2026.xlsx"),
         },
         "cards": {
             "salus": "-",

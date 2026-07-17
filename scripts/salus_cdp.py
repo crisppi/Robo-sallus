@@ -40,7 +40,7 @@ def _get_json(url: str) -> Any:
         return json.loads(response.read().decode("utf-8"))
 
 
-def find_salus_tab(cdp_url: str = DEFAULT_CDP) -> BrowserTab:
+def find_salus_tab(cdp_url: str = DEFAULT_CDP, url_contains: str | None = None) -> BrowserTab:
     tabs = _get_json(f"{cdp_url.rstrip('/')}/json")
     candidates = [
         tab
@@ -48,11 +48,25 @@ def find_salus_tab(cdp_url: str = DEFAULT_CDP) -> BrowserTab:
         if "salus.orizon.com.br" in tab.get("url", "")
         and tab.get("webSocketDebuggerUrl")
     ]
+    if url_contains:
+        preferred = [tab for tab in candidates if url_contains in tab.get("url", "")]
+        if preferred:
+            candidates = preferred
+
     if not candidates:
         raise SalusCdpError(
             "Nao encontrei uma aba do Salus no Chrome remoto. "
             "Abra o Salus logado no Chrome com --remote-debugging-port=9222."
         )
+    candidates.sort(
+        key=lambda tab: (
+            "Evolução clínica" in tab.get("title", "") or "Evolucao clinica" in tab.get("title", ""),
+            "avaliacao-internacao" in tab.get("url", ""),
+            "gestao-internacao" in tab.get("url", ""),
+            tab.get("url", "").rstrip("/") != SALUS_ORIGIN,
+        ),
+        reverse=True,
+    )
     tab = candidates[0]
     return BrowserTab(
         title=tab.get("title", ""),
@@ -61,11 +75,11 @@ def find_salus_tab(cdp_url: str = DEFAULT_CDP) -> BrowserTab:
     )
 
 
-def evaluate_js(expression: str, cdp_url: str = DEFAULT_CDP) -> Any:
-    tab = find_salus_tab(cdp_url)
+def evaluate_js(expression: str, cdp_url: str = DEFAULT_CDP, url_contains: str | None = None) -> Any:
+    tab = find_salus_tab(cdp_url, url_contains=url_contains)
     ws = websocket.create_connection(
         tab.websocket_debugger_url,
-        timeout=30,
+        timeout=120,
         suppress_origin=True,
     )
     try:
@@ -77,7 +91,7 @@ def evaluate_js(expression: str, cdp_url: str = DEFAULT_CDP) -> Any:
                 "expression": expression,
                 "awaitPromise": True,
                 "returnByValue": True,
-                "timeout": 30000,
+                "timeout": 120000,
             },
         }
         ws.send(json.dumps(payload))
@@ -93,6 +107,29 @@ def evaluate_js(expression: str, cdp_url: str = DEFAULT_CDP) -> Any:
             if result.get("subtype") == "error":
                 raise SalusCdpError(result.get("description", "Erro JavaScript"))
             return result.get("value")
+    finally:
+        ws.close()
+
+
+def navigate_salus(url: str, cdp_url: str = DEFAULT_CDP, url_contains: str | None = None) -> None:
+    """Navega a aba Salus escolhida via CDP Page.navigate."""
+    tab = find_salus_tab(cdp_url, url_contains=url_contains)
+    ws = websocket.create_connection(
+        tab.websocket_debugger_url,
+        timeout=30,
+        suppress_origin=True,
+    )
+    try:
+        message_id = int(time.time() * 1000) % 1_000_000
+        ws.send(json.dumps({"id": message_id, "method": "Page.enable"}))
+        ws.send(json.dumps({"id": message_id + 1, "method": "Page.navigate", "params": {"url": url}}))
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            message = json.loads(ws.recv())
+            if message.get("id") == message_id + 1:
+                if "error" in message:
+                    raise SalusCdpError(str(message["error"]))
+                return
     finally:
         ws.close()
 
