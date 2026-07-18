@@ -12,8 +12,10 @@ import argparse
 import datetime as dt
 import json
 import random
+import re
 import sys
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -44,8 +46,31 @@ def filled_values(clinical_patient: ClinicalPatient) -> dict[str, str]:
         # Regra operacional: na ausência de mudança diagnóstica explicitamente
         # marcada na geração da base, o CID ajustado repete o CID inicial.
         values["Dados da Internação - CID ajustado *"] = values["Dados da Internação - CID de internação *"]
-    if not values.get("Dados da Internação - Comorbidades *"):
-        values["Dados da Internação - Comorbidades *"] = "0SC - Sem comorbidades"
+    evolution = values.get("evolucao", "").lower()
+    if not values.get("Dados da Internação - Acomodação *"):
+        values["Dados da Internação - Acomodação *"] = "UTI"
+    if not values.get("Dados da Internação - Paciente em isolamento? *"):
+        values["Dados da Internação - Paciente em isolamento? *"] = "Não"
+    if not values.get("Dados da Internação - Queixa *"):
+        if any(term in evolution for term in ("dor torác", "dor torac", "dor no peito", "precord", "sca")):
+            complaint = "Dor no peito"
+        elif any(term in evolution for term in ("cansaço", "cansaco", "fadiga")):
+            complaint = "Fadiga / cansaço"
+        elif any(term in evolution for term in ("pneum", "broncoasp", "bcp", "tosse")):
+            complaint = "Tosse"
+        else:
+            complaint = "Dor inespecífica"
+        values["Dados da Internação - Queixa *"] = complaint
+    current_comorbidities = values.get("Dados da Internação - Comorbidades *", "")
+    if not current_comorbidities or current_comorbidities.startswith("0SC"):
+        comorbidities = []
+        if re.search(r"\b(?:has|hipertens)", evolution, re.I):
+            comorbidities.append("I10 - Hipertensão essencial (primária)")
+        if re.search(r"\b(?:dac|coronariopatia)", evolution, re.I):
+            comorbidities.append("I25 - Doença isquêmica crônica do coração")
+        if re.search(r"\b(?:dlp|dislipidem)", evolution, re.I):
+            comorbidities.append("E78 - Distúrbios do metabolismo de lipoproteínas e outras lipidemias")
+        values["Dados da Internação - Comorbidades *"] = "; ".join(comorbidities) or current_comorbidities or "0SC - Sem comorbidades"
     if not values.get("Exame Físico - Mobilidade e dependência *"):
         values["Exame Físico - Mobilidade e dependência *"] = "Deambulando"
     if not values.get("Exame Físico - Acesso venoso? *"):
@@ -56,6 +81,33 @@ def filled_values(clinical_patient: ClinicalPatient) -> dict[str, str]:
         values["Exame Físico - Alimentação *"] = "Oral"
     if not values.get("Exame Físico - Controle de eliminação *"):
         values["Exame Físico - Controle de eliminação *"] = "Normal"
+    values.setdefault("UTI - Monitorização *", "Não")
+    values.setdefault("UTI - Uso de droga vasoativa? *", "Não")
+    for lab_field, flag_field in [
+        ("UTI - Creatinina sérica (mg/dL) *", "UTI - Não mensurado * (cond.)"),
+        ("UTI - pH arterial *", "UTI - Não mensurado * (cond.) [2]"),
+        ("UTI - PaO2 (mmHg) *", "UTI - Não mensurado * (cond.) [3]"),
+        ("UTI - FiO2 (%) *", "UTI - Não mensurado * (cond.) [4]"),
+    ]:
+        if not values.get(lab_field):
+            values[flag_field] = "Sim"
+    if not values.get("UTI - Categoria do diagnóstico principal *"):
+        if any(term in evolution for term in ("pneum", "broncoasp", "bcp", "respirat")):
+            category = "Respiratório"
+        elif any(term in evolution for term in ("sca", "dac", "coronar", "cardi")):
+            category = "Cardiovascular"
+        elif any(term in evolution for term in ("sepse", "sépt", "sept")):
+            category = "Sepse"
+        elif any(term in evolution for term in ("avc", "neurol", "convuls")):
+            category = "Neurológico"
+        elif "trauma" in evolution:
+            category = "Trauma"
+        else:
+            category = "Transplante/Outro (Crítico)"
+        values["UTI - Categoria do diagnóstico principal *"] = category
+    creatinine = re.search(r"creatinina\s*([0-9]+(?:[.,][0-9]+)?)", evolution, re.I)
+    if creatinine:
+        values["UTI - Creatinina sérica (mg/dL) *"] = creatinine.group(1).replace(",", ".")
     for field in [
         "Conduta Clínica - Uso de antibiótico? *",
         "Conduta Clínica - Uso de antifúngico? *",
@@ -73,6 +125,25 @@ def filled_values(clinical_patient: ClinicalPatient) -> dict[str, str]:
     ):
         values["Conduta Clínica - Tipo de Quimioterapia * (cond.)"] = "Curativa"
     return values
+
+
+def infer_cid_from_evolution(text: str) -> str:
+    """Infere CID somente quando a evolução declara claramente o diagnóstico."""
+    normalized = "".join(
+        char for char in unicodedata.normalize("NFD", text.lower())
+        if unicodedata.category(char) != "Mn"
+    )
+    rules = (
+        (("broncoaspir", "bcp aspirativa", "pneumonia aspirativa"), "J69.0"),
+        (("sindrome coronariana aguda", "sca"), "I24.9"),
+        (("alteracao de habito intestinal",), "R19.4"),
+        (("abscesso dentario",), "K04.7"),
+        (("gastroenterocolite",), "A09"),
+    )
+    for terms, cid in rules:
+        if any(term in normalized for term in terms):
+            return cid
+    return ""
 
 
 def build_browser_payload(clinical_patient: ClinicalPatient, confirmar: bool) -> dict[str, Any]:
@@ -122,6 +193,28 @@ def update_lancamento_control(clinica_path: Path, controle_path: Path, patient: 
             wb.save(controle_path)
             return
     raise RuntimeError(f"Senha {patient.senha} nao encontrada no arquivo de controle.")
+
+
+def read_lancamento_status(controle_path: Path, senha: str) -> str:
+    """Retorna o status persistido para impedir duas tentativas na mesma senha."""
+    if not controle_path.exists():
+        return ""
+
+    wb = load_workbook(controle_path, read_only=True, data_only=True)
+    try:
+        ws = wb["Preenchimento"] if "Preenchimento" in wb.sheetnames else wb.active
+        headers = {value_to_text(cell.value): idx for idx, cell in enumerate(ws[1], start=1)}
+        senha_col = headers.get("Senha")
+        status_col = headers.get("Lançamento Salus - Status")
+        if not senha_col or not status_col:
+            return ""
+        senha_normalizada = value_to_text(senha)
+        for row in range(2, ws.max_row + 1):
+            if value_to_text(ws.cell(row, senha_col).value) == senha_normalizada:
+                return value_to_text(ws.cell(row, status_col).value).strip()
+        return ""
+    finally:
+        wb.close()
 
 
 def run_html_fill(
@@ -829,6 +922,7 @@ def run_html_fill(
           }};
           const logs = [];
           logs.push(`creatinina=${{setText(fieldInput('Creatinina sérica (mg/dL)'), {json.dumps(value('UTI - Creatinina sérica (mg/dL) *'))})}}`);
+          if (norm({json.dumps(value('UTI - Não mensurado * (cond.)'))}).startsWith('sim')) logs.push(`creatinina-nao=${{notMeasured('Creatinina sérica (mg/dL)')}}`);
           if (norm({json.dumps(value('UTI - Não mensurado * (cond.) [2]'))}).startsWith('sim')) logs.push(`ph-nao=${{notMeasured('pH arterial')}}`);
           if (norm({json.dumps(value('UTI - Não mensurado * (cond.) [3]'))}).startsWith('sim')) logs.push(`pao2-nao=${{notMeasured('PaO2 (mmHg)')}}`);
           if (norm({json.dumps(value('UTI - Não mensurado * (cond.) [4]'))}).startsWith('sim')) logs.push(`fio2-nao=${{notMeasured('FiO2 (%)')}}`);
@@ -1074,6 +1168,36 @@ def run_html_fill(
         """
         all_logs.append(str(eval_sec(secao, js)))
 
+    def click_radio_by_question(secao: str, question: str, val: str) -> None:
+        if not val:
+            return
+        js = f"""
+        (() => {{
+          const norm = (value) => String(value ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+          const question = norm({json.dumps(question)});
+          const wanted = norm({json.dumps(val)});
+          const nodes = [...document.querySelectorAll('label,legend,h1,h2,h3,h4,p,span,div')]
+            .filter(el => norm(el.innerText) === question || norm(el.innerText).startsWith(question));
+          for (const node of nodes) {{
+            let group = node.parentElement;
+            for (let level = 0; group && level < 5; level++, group = group.parentElement) {{
+              const radios = [...group.querySelectorAll('input[type="radio"]')];
+              const target = radios.find(input => {{
+                const label = norm(input.closest('label')?.innerText || input.parentElement?.innerText || input.value);
+                return label === wanted || label.startsWith(wanted) || norm(input.value) === wanted;
+              }});
+              if (target) {{
+                if (!target.checked) target.click();
+                for (const eventName of ['input', 'change', 'blur']) target.dispatchEvent(new Event(eventName, {{bubbles: true}}));
+                return `opcao por pergunta: {question}`;
+              }}
+            }}
+          }}
+          return `pergunta/opcao nao encontrada: {question}`;
+        }})()
+        """
+        all_logs.append(str(eval_sec(secao, js)))
+
 
     def click_checkbox_label(secao: str, val: str) -> None:
         if not val:
@@ -1095,6 +1219,25 @@ def run_html_fill(
           input.scrollIntoView({{block: 'center'}});
           if (!input.checked) input.click();
           return `checkbox: {val}`;
+        }})()
+        """
+        all_logs.append(str(eval_sec(secao, js)))
+
+    def set_checkbox_label(secao: str, val: str, checked: bool) -> None:
+        if not val:
+            return
+        js = f"""
+        (() => {{
+          const norm = (value) => String(value ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+          const wanted = norm({json.dumps(val)});
+          const labelOf = (input) => norm(input.closest('label')?.innerText || input.parentElement?.innerText || input.parentElement?.parentElement?.innerText || '');
+          const input = [...document.querySelectorAll('input[type="checkbox"]')]
+            .find(el => labelOf(el) === wanted || labelOf(el).includes(wanted));
+          if (!input) return `checkbox nao encontrado: {val}`;
+          const desired = {str(checked).lower()};
+          if (input.checked !== desired) input.click();
+          for (const eventName of ['input', 'change', 'blur']) input.dispatchEvent(new Event(eventName, {{bubbles: true}}));
+          return `checkbox sincronizado: {val}=${str(checked).lower()}`;
         }})()
         """
         all_logs.append(str(eval_sec(secao, js)))
@@ -1125,9 +1268,9 @@ def run_html_fill(
         """
         all_logs.append(str(eval_sec(secao, js)))
 
-    def choose_multi(secao: str, selector: str, raw: str) -> None:
+    def choose_multi(secao: str, selector: str, raw: str) -> str:
         if not raw:
-            return
+            return "valor vazio"
         js = f"""
         (async () => {{
           const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -1141,16 +1284,26 @@ def run_html_fill(
           const norm = (value) => String(value ?? '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toLowerCase();
           let text = norm(trigger.innerText);
           const parts = {json.dumps([part.strip() for part in raw.split(";") if part.strip()], ensure_ascii=False)};
+          let selectedCount = 0;
           const hasRealValue = (value) => value
             && !value.includes('busque')
             && !value.includes('selecione')
             && !value.includes('pesquisar')
+            && !/^0\s+selecionado/.test(value)
             && value !== '▾'
             && value !== 'x ▾'
             && value !== '× ▾';
           const needles = (part) => {{
             const dash = part.indexOf(' - ');
-            const terms = [part.trim()];
+            const original = part.trim();
+            const terms = [];
+            // O catálogo CID do Salus não encontra códigos digitados com ponto.
+            // Pesquisa primeiro a categoria (J69), depois o código compacto (J690).
+            if (/^[a-z]\d/i.test(original)) {{
+              if (original.includes('.')) terms.push(original.split('.')[0]);
+              terms.push(original.replace(/\./g, ''));
+            }}
+            terms.push(original);
             if (dash > 0) {{
               const code = part.slice(0, dash).trim();
               terms.push(code);
@@ -1196,12 +1349,15 @@ def run_html_fill(
           const searchParts = isComplaint ? [...parts, ...parts.flatMap(part => complaintFallbacks(part))] : parts;
           const lastSearchPart = searchParts[searchParts.length - 1];
           for (const part of searchParts) {{
-            trigger.click();
-            await sleep(400);
-            let search = null;
+            let search = [...document.querySelectorAll('input[type="text"]')]
+              .reverse().find(el => (norm(el.placeholder).includes('pesquisar') || String(el.id).includes('multi-select-search')) && el.offsetParent !== null);
+            if (!search) {{
+              trigger.click();
+              await sleep(400);
+            }}
             for (let i = 0; i < 10; i++) {{
               search = [...document.querySelectorAll('input[type="text"]')]
-                .reverse().find(el => norm(el.placeholder).includes('pesquisar') || String(el.id).includes('multi-select-search'));
+                .reverse().find(el => (norm(el.placeholder).includes('pesquisar') || String(el.id).includes('multi-select-search')) && el.offsetParent !== null);
               if (search) break;
               await sleep(300);
             }}
@@ -1226,12 +1382,15 @@ def run_html_fill(
               if (option) break;
             }}
             if (option) {{
-              option.dispatchEvent(new PointerEvent('pointerdown', {{bubbles: true}}));
-              option.dispatchEvent(new MouseEvent('mousedown', {{bubbles: true}}));
-              option.dispatchEvent(new MouseEvent('mouseup', {{bubbles: true}}));
               option.click();
+              selectedCount += 1;
             }} else {{
               if (isComplaint && part !== lastSearchPart) {{
+                document.body.click();
+                await sleep(300);
+                continue;
+              }}
+              if (!isComplaint) {{
                 document.body.click();
                 await sleep(300);
                 continue;
@@ -1239,13 +1398,17 @@ def run_html_fill(
               return `opcao pesquisavel nao encontrada apos espera: ${{part}}`;
             }}
             await sleep(300);
-            break;
+            if (isComplaint) break;
           }}
           document.body.click();
-          return `multiselect: {selector}`;
+          return selectedCount > 0
+            ? `multiselect: {selector}; selecionados=${{selectedCount}}`
+            : `nenhuma opcao encontrada: {selector}`;
         }})()
         """
-        all_logs.append(str(eval_sec(secao, js)))
+        result = str(eval_sec(secao, js))
+        all_logs.append(result)
+        return result
 
     def multi_has_value(secao: str, selector: str, raw: str) -> bool:
         if not raw:
@@ -1292,6 +1455,20 @@ def run_html_fill(
         """
         return bool(eval_sec(secao, js))
 
+    def multi_current_value(secao: str, selector: str) -> str:
+        js = f"""
+        (() => {{
+          const trigger = document.querySelector({json.dumps(selector)});
+          if (!trigger) return '';
+          const selected = trigger.querySelector('span');
+          const text = String(selected?.innerText || trigger.innerText || '')
+            .replace(/[✕×▾]/g, '').replace(/\s+/g, ' ').trim();
+          if (/busque|selecione|pesquisar/i.test(text)) return '';
+          return text;
+        }})()
+        """
+        return str(eval_sec(secao, js) or "").strip()
+
     def choose_required_multi(secao: str, selector: str, raw: str, label: str) -> None:
         if not raw:
             raise RuntimeError(f"{label}: valor obrigatório vazio antes do preenchimento.")
@@ -1307,6 +1484,85 @@ def run_html_fill(
             all_logs.append(f"{label}: tentativa {attempt + 1} nao persistiu")
         raise RuntimeError(f"{label}: nao persistiu no HTML apos 3 tentativas ({raw}).")
 
+    def choose_comorbidities(secao: str, raw: str) -> None:
+        """Seleciona comorbidades disponíveis; usa Sem comorbidades como fallback."""
+        items = [item.strip() for item in raw.split(";") if item.strip()]
+
+        def select_code(code: str) -> Any:
+            return eval_sec(
+                secao,
+                f"""
+                (async () => {{
+                  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+                  const trigger = document.querySelector('#admission-comorbidities');
+                  if (!trigger) return {{ok:false, error:'campo não encontrado'}};
+                  if (String(trigger.innerText).includes({json.dumps(code)})) return {{ok:true, already:true}};
+                  let search = [...document.querySelectorAll('input[type="text"]')]
+                    .reverse().find(el => el.placeholder === 'Pesquisar' && el.offsetParent !== null);
+                  if (!search) {{
+                    trigger.click();
+                    await sleep(500);
+                    search = [...document.querySelectorAll('input[type="text"]')]
+                      .reverse().find(el => el.placeholder === 'Pesquisar' && el.offsetParent !== null);
+                  }}
+                  if (!search) return {{ok:false, error:'pesquisa não abriu'}};
+                  search.value = {json.dumps(code)};
+                  search.dispatchEvent(new Event('input', {{bubbles:true}}));
+                  await sleep(2200);
+                  const option = [...document.querySelectorAll('button.multi-select__option')]
+                    .find(el => String(el.innerText || '').trim().startsWith({json.dumps(code + ' -')}));
+                  if (!option) return {{ok:false, error:'opção não encontrada'}};
+                  option.click();
+                  await sleep(700);
+                  return {{ok:String(trigger.innerText).includes({json.dumps(code)}), value:trigger.innerText}};
+                }})()
+                """,
+            )
+
+        selected_codes: list[str] = []
+        for item in items:
+            code = item.split(" - ", 1)[0].strip()
+            result = select_code(code)
+            if not isinstance(result, dict) or not result.get("ok"):
+                all_logs.append(f"Comorbidade {code}: ignorada, não encontrada no catálogo")
+                continue
+            selected_codes.append(code)
+            all_logs.append(f"Comorbidade {code}: confirmada no HTML")
+
+        if not selected_codes:
+            fallback = select_code("0SC")
+            if not isinstance(fallback, dict) or not fallback.get("ok"):
+                raise RuntimeError(f"Sem comorbidades não persistiu no HTML: {fallback}")
+            selected_codes = ["0SC"]
+            all_logs.append("Nenhuma comorbidade encontrada; aplicado Sem comorbidades")
+
+        closed = eval_sec(
+            secao,
+            f"""
+            (async () => {{
+              const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+              const trigger = document.querySelector('#admission-comorbidities');
+              document.body.dispatchEvent(new MouseEvent('mousedown', {{bubbles:true}}));
+              document.body.click();
+              await sleep(300);
+              const openPanel = [...document.querySelectorAll('.cdk-overlay-pane')]
+                .find(panel => panel.offsetParent !== null);
+              if (openPanel) {{
+                trigger?.click();
+                await sleep(300);
+              }}
+              const codes = {json.dumps(selected_codes, ensure_ascii=False)};
+              return Boolean(trigger)
+                && codes.every(code => String(trigger.innerText || '').includes(code))
+                && ![...document.querySelectorAll('.cdk-overlay-pane')].some(panel => panel.offsetParent !== null);
+            }})()
+            """,
+        )
+        time.sleep(0.5)
+        if not closed:
+            raise RuntimeError("Comorbidades não permaneceram selecionadas após fechar o menu.")
+        all_logs.append("Comorbidades: menu fechado e valores persistidos")
+
     def next_sec(secao: str) -> None:
         js = """
         (() => {
@@ -1319,6 +1575,30 @@ def run_html_fill(
         """
         all_logs.append(f"proximo {secao}: {eval_sec(secao, js)}")
         time.sleep(2.5)
+        section_titles = {
+            "100001": "Dados da Internação",
+            "100002": "Exame Físico",
+            "100006": "UTI",
+            "100003": "Conduta Clínica",
+            "100004": "Condição Adquirida",
+            "100005": "Parecer do Auditor",
+        }
+        title = section_titles.get(secao, "")
+        completed = evaluate_js(
+            f"""
+            (() => {{
+              const norm = value => String(value || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').trim().toLowerCase();
+              const expected = norm({json.dumps(title)});
+              const item = [...document.querySelectorAll('.evaluation-stepper__item')]
+                .find(el => norm(el.innerText).includes(expected));
+              return Boolean(item && item.classList.contains('evaluation-stepper__item--completed'));
+            }})()
+            """,
+            cdp_url=cdp_url,
+            url_contains=f"/avaliacao-internacao/{clinical_patient.id_internacao}/",
+        )
+        if not completed:
+            raise RuntimeError(f"Página {title} não ficou verde; lote interrompido neste paciente.")
         print(f"HTML: secao {secao} finalizada", flush=True)
 
     open_sec("100001")
@@ -1328,9 +1608,13 @@ def run_html_fill(
     click_checkbox_label("100001", value("Dados da Internação - Motivo do isolamento * (cond.)"))
     choose_multi("100001", "#admission-complaint", value("Dados da Internação - Queixa *"))
     admission_cid_value = value("Dados da Internação - CID de internação *")
-    adjusted_cid_value = admission_cid_value
+    if not admission_cid_value:
+        admission_cid_value = infer_cid_from_evolution(value("evolucao"))
     choose_multi("100001", "#admission-cid", admission_cid_value)
-    choose_multi("100001", "#admission-comorbidities", value("Dados da Internação - Comorbidades *"))
+    if not admission_cid_value:
+        admission_cid_value = multi_current_value("100001", "#admission-cid")
+    adjusted_cid_value = value("Dados da Internação - CID ajustado *") or admission_cid_value
+    choose_comorbidities("100001", value("Dados da Internação - Comorbidades *"))
     choose_required_multi("100001", "#admission-adjusted-cid", adjusted_cid_value, "CID ajustado")
     set_duration_combo("100001", value("Dados da Internação - Tempo de existência da doença *"), value_or("Dados da Internação - Nomenclatura do tempo de existência da doença *", "Dias"))
     next_sec("100001")
@@ -1404,20 +1688,56 @@ def run_html_fill(
 
     click_radio("100003", "cc-med-usage-antibiotic", antibiotic_yn)
     if antibiotic_yn.lower().startswith("s"):
-        choose_multi("100003", "#medicamento-search-multi-select-0", value("Conduta Clínica - Selecione os antibióticos em uso * (cond.)"))
-        fill_antibiotic_details("100003")
+        antibiotic_result = choose_multi("100003", "#medicamento-search-multi-select-0", value("Conduta Clínica - Selecione os antibióticos em uso * (cond.)"))
+        if antibiotic_result.startswith("nenhuma opcao") or antibiotic_result == "valor vazio":
+            click_radio("100003", "cc-med-usage-antibiotic", "Não")
+        else:
+            fill_antibiotic_details("100003")
     click_radio("100003", "cc-med-usage-antifungal", antifungal_yn)
     if antifungal_yn.lower().startswith("s"):
-        choose_multi("100003", "#clinical-conduct-antifungal-options", value("Conduta Clínica - Selecione os antifúngicos em uso * (cond.)"))
+        antifungal_result = choose_multi("100003", "#clinical-conduct-antifungal-options", value("Conduta Clínica - Selecione os antifúngicos em uso * (cond.)"))
+        if antifungal_result.startswith("nenhuma opcao") or antifungal_result == "valor vazio":
+            click_radio("100003", "cc-med-usage-antifungal", "Não")
+        else:
+            click_radio_by_question("100003", "Via do antifúngico", value_or("Conduta Clínica - Via do antifúngico * (cond.)", "Via intravenosa"))
     click_radio("100003", "cc-med-usage-antiviral", antiviral_yn)
     if antiviral_yn.lower().startswith("s"):
-        choose_multi("100003", "#clinical-conduct-antiviral-options", value("Conduta Clínica - Selecione os antivirais em uso * (cond.)"))
+        antiviral_result = choose_multi("100003", "#clinical-conduct-antiviral-options", value("Conduta Clínica - Selecione os antivirais em uso * (cond.)"))
+        if antiviral_result.startswith("nenhuma opcao") or antiviral_result == "valor vazio":
+            click_radio("100003", "cc-med-usage-antiviral", "Não")
+        else:
+            click_radio_by_question("100003", "Via do antiviral", value_or("Conduta Clínica - Via do antiviral * (cond.)", "Via intravenosa"))
+    click_radio_by_question(
+        "100003",
+        "Câmara Hiperbárica",
+        value_or("Conduta Clínica - Câmara Hiperbárica * (cond.)", "Não"),
+    )
     click_radio("100003", "dynamic-question-91", value_or("Conduta Clínica - Administração de Imunoglobulina *", "Não"))
     click_radio("100003", "dynamic-question-92", active_therapy_yn)
     if active_therapy_yn.lower().startswith("s"):
         therapies = value("Conduta Clínica - Terapias em andamento * (cond.)")
+        set_checkbox_label(
+            "100003",
+            "Terapia Renal Substitutiva (TRS)",
+            "terapia renal substitutiva" in therapies.lower(),
+        )
         for item in therapies.split(";"):
             click_checkbox_label("100003", item.strip())
+        if "terapia renal substitutiva" in therapies.lower():
+            click_radio_by_question(
+                "100003",
+                "Tipo de terapia renal substitutiva (TRS)",
+                value_or(
+                    "Conduta Clínica - Tipo de terapia renal substitutiva (TRS) * (cond.)",
+                    "Hemodiálise",
+                ),
+            )
+        if "radioterapia" in therapies.lower():
+            click_radio_by_question(
+                "100003",
+                "Tipo de radioterapia",
+                value_or("Conduta Clínica - Tipo de radioterapia * (cond.)", "Convencional"),
+            )
         if "quimioterapia" in therapies.lower():
             click_radio(
                 "100003",
@@ -1454,7 +1774,24 @@ def run_html_fill(
     open_sec("100005")
     click_radio("100005", "dynamic-question-144", value("Parecer do Auditor - Pertinência Técnica da Internação *"))
     click_radio("100005", "dynamic-question-145", value("Parecer do Auditor - Pertinência Técnica da permanência hospitalar *"))
-    click_radio("100005", "dynamic-question-146", value("Parecer do Auditor - Paciente permanece internado? *"))
+    remains_admitted = value_or("Parecer do Auditor - Paciente permanece internado? *", "Sim")
+    click_radio("100005", "dynamic-question-146", remains_admitted)
+    if remains_admitted.lower().startswith("n"):
+        click_radio(
+            "100005",
+            "dynamic-question-151",
+            value_or("Parecer do Auditor - Selecione o desfecho assistencial * (cond.)", "Alta melhorada"),
+        )
+        set_input(
+            "100005",
+            'input[type="date"]',
+            date_html(value("Parecer do Auditor - Data do desfecho * (cond.)")),
+        )
+        set_input(
+            "100005",
+            'input[type="time"]',
+            value("Parecer do Auditor - Hora do desfecho * (cond.)"),
+        )
     fill_auditor_history("100005", value_or("Dados da Internação - Acomodação *", "UTI"))
     click_auditor_radio_label("100005", value_or("Parecer do Auditor - Programação de alta * (cond.)", "Sem programação de alta"))
     operator_pending = value("Parecer do Auditor - Pendências da operadora (cond.)")
@@ -1473,8 +1810,15 @@ def run_html_fill(
         (async () => {
           const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
           const norm = (value) => String(value ?? '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toLowerCase();
+          const stepItems = [...document.querySelectorAll('.evaluation-stepper__item')];
+          const incompleteSteps = stepItems
+            .filter(item => !item.classList.contains('evaluation-stepper__item--completed') && !item.classList.contains('evaluation-stepper__item--current'))
+            .map(item => item.querySelector('.evaluation-stepper__label')?.innerText?.trim() || 'Página sem nome');
+          const completedSteps = stepItems
+            .filter(item => item.classList.contains('evaluation-stepper__item--completed'))
+            .map(item => item.querySelector('.evaluation-stepper__label')?.innerText?.trim() || 'Página sem nome');
           const confirmButton = [...document.querySelectorAll('button')].find(b => norm(b.innerText) === 'confirmar evolucao' || norm(b.innerText) === 'confirmar evolução');
-          const confirmEnabled = Boolean(confirmButton && !confirmButton.disabled);
+          const confirmEnabled = Boolean(confirmButton && !confirmButton.disabled && incompleteSteps.length === 0);
           let saved = false;
           if (__CONFIRMAR__ && confirmEnabled) {
             confirmButton.click();
@@ -1487,7 +1831,7 @@ def run_html_fill(
               await sleep(1800);
             }
           }
-          return {href: location.href, confirmEnabled, confirmed: Boolean(__CONFIRMAR__ && confirmEnabled), saved, summary: document.body.innerText.slice(0, 6000)};
+          return {href: location.href, confirmEnabled, confirmed: Boolean(__CONFIRMAR__ && confirmEnabled), saved, completedSteps, incompleteSteps, summary: document.body.innerText.slice(0, 6000)};
         })()
         """.replace("__CONFIRMAR__", "true" if confirmar else "false"),
     )
@@ -1496,12 +1840,21 @@ def run_html_fill(
 
 
 def main() -> int:
+    today = dt.date.today().strftime("%d_%m_%Y")
     parser = argparse.ArgumentParser(description="Preenche evolucao clinica no Salus via HTML.")
     parser.add_argument("--fila", required=True)
     parser.add_argument("--clinica", required=True)
     parser.add_argument("--saida")
-    parser.add_argument("--controle-lancamento", default="exports/data_base_lancamento_16_07_2026.xlsx")
+    parser.add_argument(
+        "--controle-lancamento",
+        default=f"exports/data_base_lancamento_{today}.xlsx",
+    )
     parser.add_argument("--senha", required=True)
+    parser.add_argument(
+        "--forcar-reprocessamento",
+        action="store_true",
+        help="Permite repetir uma senha que ja possui tentativa registrada.",
+    )
     parser.add_argument("--confirmar", action="store_true", help="Clica em Confirmar evolução se o botao estiver habilitado.")
     parser.add_argument(
         "--preencher-obrigatorios-medios",
@@ -1512,6 +1865,13 @@ def main() -> int:
     args = parser.parse_args()
 
     patient, clinical_patient = find_patient(Path(args.fila), Path(args.clinica), args.senha)
+    controle_path = Path(args.controle_lancamento)
+    status_anterior = read_lancamento_status(controle_path, patient.senha)
+    if status_anterior and not args.forcar_reprocessamento:
+        raise RuntimeError(
+            f"Senha {patient.senha} ja processada com status {status_anterior}; "
+            "repeticao automatica bloqueada."
+        )
     if not clinical_patient.id_internacao:
         raise RuntimeError(f"Paciente {args.senha} sem ID internacao na planilha clinica.")
 
@@ -1524,12 +1884,13 @@ def main() -> int:
     status = "HTML_CONFIRMADO" if args.confirmar and result.get("confirmEnabled") else "HTML_PREENCHIDO"
     if args.confirmar and not result.get("confirmEnabled"):
         status = "ERRO"
-    message = (
-        "Tela HTML preenchida. Botao Confirmar evolucao habilitado."
-        if result.get("confirmEnabled")
-        else "Tela HTML preenchida, mas Confirmar evolucao ainda esta desabilitado."
-    )
-    update_lancamento_control(Path(args.clinica), Path(args.controle_lancamento), patient, result, message)
+    if result.get("confirmEnabled"):
+        message = "Tela HTML preenchida. Botao Confirmar evolucao habilitado."
+    elif result.get("incompleteSteps"):
+        message = "Paginas sem check verde: " + ", ".join(result["incompleteSteps"])
+    else:
+        message = "Tela HTML preenchida, mas Confirmar evolucao ainda esta desabilitado."
+    update_lancamento_control(Path(args.clinica), controle_path, patient, result, message)
     if args.saida:
         write_report(
             [

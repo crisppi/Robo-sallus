@@ -40,7 +40,7 @@ IDENTITY_HEADERS = {
     "id internação",
 }
 
-SUCCESS_STATUSES = {"SUCESSO", "SUCESSO_COM_ALERTA"}
+SUCCESS_STATUSES = {"SUCESSO", "SUCESSO_COM_ALERTA", "SUCESSO_MANUAL"}
 MULTIPLE_TYPES = {"LISTA_MULTIPLA"}
 MULTIPLE_CONTROLS = {"CHECKBOX_MULTI", "MULTISELECT"}
 YES_VALUES = {"sim", "s", "yes", "y", "true", "1"}
@@ -293,6 +293,18 @@ def read_clinical(path: Path) -> tuple[dict[str, list[ClinicalPatient]], dict[st
             for header, col in headers.items()
             if header in field_headers
         }
+        evolution_text = value_to_text(values.get("evolucao")).lower()
+        if any(term in evolution_text for term in ("dialise pausada", "diálise pausada", "pausado dialise", "pausada dialise")):
+            therapies = value_to_text(values.get("Conduta Clínica - Terapias em andamento * (cond.)"))
+            active_therapies = [
+                item.strip()
+                for item in therapies.split(";")
+                if item.strip() and "renal substitutiva" not in item.lower()
+            ]
+            values["Conduta Clínica - Terapias em andamento * (cond.)"] = "; ".join(active_therapies)
+            values["Conduta Clínica - Tipo de terapia renal substitutiva (TRS) * (cond.)"] = ""
+            if not active_therapies:
+                values["Conduta Clínica - Terapias Ativas (ex .: fisioterapia, suporte clínico) * *"] = "Não"
         admission_cid = values.get("Dados da Internação - CID de internação *")
         if not is_blank(admission_cid):
             # Regra operacional: se não houver mudança diagnóstica
@@ -300,20 +312,44 @@ def read_clinical(path: Path) -> tuple[dict[str, list[ClinicalPatient]], dict[st
             values["Dados da Internação - CID ajustado *"] = admission_cid
         if is_blank(values.get("Dados da Internação - Comorbidades *")):
             values["Dados da Internação - Comorbidades *"] = "0SC - Sem comorbidades"
+        if is_blank(values.get("Exame Físico - Estado geral *")):
+            values["Exame Físico - Estado geral *"] = "REG – Regular Estado Geral"
+        if is_blank(values.get("Exame Físico - Nível de consciência *")):
+            values["Exame Físico - Nível de consciência *"] = "Orientado"
         if is_blank(values.get("Exame Físico - Mobilidade e dependência *")):
             values["Exame Físico - Mobilidade e dependência *"] = "Deambulando"
         if is_blank(values.get("Exame Físico - Acesso venoso? *")):
             values["Exame Físico - Acesso venoso? *"] = "Sim"
         if is_blank(values.get("Exame Físico - Qual o acesso venoso? * (cond.)")):
             values["Exame Físico - Qual o acesso venoso? * (cond.)"] = "Periférico"
+        if is_blank(values.get("Exame Físico - Via respiratória *")):
+            values["Exame Físico - Via respiratória *"] = "Normal"
+        if is_blank(values.get("Exame Físico - Suporte respiratório *")):
+            values["Exame Físico - Suporte respiratório *"] = "Ar ambiente"
         if is_blank(values.get("Exame Físico - Alimentação *")):
             values["Exame Físico - Alimentação *"] = "Oral"
+        if is_blank(values.get("Exame Físico - Lesões na pele? *")):
+            values["Exame Físico - Lesões na pele? *"] = "Não"
         if is_blank(values.get("Exame Físico - Controle de eliminação *")):
             values["Exame Físico - Controle de eliminação *"] = "Normal"
+        # Regra operacional fixa para o bloco UTI.
+        values["UTI - 1. Abertura Ocular (E) - Selecione a melhor resposta observada. *"] = (
+            "NT – Não testável (ex.: olhos fechados por fator local)"
+        )
+        values["UTI - 2. Resposta Verbal (V) - Avaliar conteúdo da comunicação verbal. *"] = (
+            "NT – Não testável (ex.: intubação, afasia)"
+        )
+        values["UTI - 3. Melhor Resposta Motora (M) - Registrar a melhor resposta obtida. *"] = (
+            "NT – Não testável (fator limitante)"
+        )
+        values["UTI - 4. Resposta Pupilar (P) - Avaliar reatividade pupilar ao estímulo luminoso. *"] = (
+            "0 – Reação bilateral ao estímulo"
+        )
         for field in [
             "Conduta Clínica - Uso de antibiótico? *",
             "Conduta Clínica - Uso de antifúngico? *",
             "Conduta Clínica - Uso de antiviral? *",
+            "Conduta Clínica - Câmara Hiperbárica * (cond.)",
             "Conduta Clínica - Administração de Imunoglobulina *",
             "Conduta Clínica - Terapias Ativas (ex .: fisioterapia, suporte clínico) * *",
             "Conduta Clínica - Realizado procedimento cirúrgico? *",
@@ -321,11 +357,122 @@ def read_clinical(path: Path) -> tuple[dict[str, list[ClinicalPatient]], dict[st
         ]:
             if is_blank(values.get(field)):
                 values[field] = "Não"
+        # Condição adquirida nunca é inferida automaticamente. O valor "Sim"
+        # somente é respeitado quando estiver explicitamente preenchido na base.
         if (
             "quimioterapia" in value_to_text(values.get("Conduta Clínica - Terapias em andamento * (cond.)")).lower()
             and is_blank(values.get("Conduta Clínica - Tipo de Quimioterapia * (cond.)"))
         ):
             values["Conduta Clínica - Tipo de Quimioterapia * (cond.)"] = "Curativa"
+        if (
+            "terapia renal substitutiva" in value_to_text(values.get("Conduta Clínica - Terapias em andamento * (cond.)")).lower()
+            and is_blank(values.get("Conduta Clínica - Tipo de terapia renal substitutiva (TRS) * (cond.)"))
+        ):
+            values["Conduta Clínica - Tipo de terapia renal substitutiva (TRS) * (cond.)"] = "Hemodiálise"
+        if (
+            "radioterapia" in value_to_text(values.get("Conduta Clínica - Terapias em andamento * (cond.)")).lower()
+            and is_blank(values.get("Conduta Clínica - Tipo de radioterapia * (cond.)"))
+        ):
+            values["Conduta Clínica - Tipo de radioterapia * (cond.)"] = "Convencional"
+
+        if value_to_text(values.get("Conduta Clínica - Uso de antifúngico? *")).lower().startswith("s"):
+            if is_blank(values.get("Conduta Clínica - Via do antifúngico * (cond.)")):
+                values["Conduta Clínica - Via do antifúngico * (cond.)"] = "Via intravenosa"
+        if value_to_text(values.get("Conduta Clínica - Uso de antiviral? *")).lower().startswith("s"):
+            if is_blank(values.get("Conduta Clínica - Via do antiviral * (cond.)")):
+                values["Conduta Clínica - Via do antiviral * (cond.)"] = "Via intravenosa"
+
+        surgery_yn = value_to_text(
+            values.get("Conduta Clínica - Realizado procedimento cirúrgico? *")
+        ).lower()
+        if surgery_yn.startswith("s"):
+            required_surgery_fields = [
+                "Conduta Clínica - TUSS + Nome do Procedimento * (cond.)",
+                "Conduta Clínica - Quantidade Solicitada * (cond.)",
+                "Conduta Clínica - Quantidade Autorizada * (cond.)",
+                "Conduta Clínica - Quantidade Realizada * (cond.)",
+                "Conduta Clínica - Tipo de anestesia * (cond.)",
+            ]
+            if any(is_blank(values.get(field)) for field in required_surgery_fields):
+                values["Conduta Clínica - Realizado procedimento cirúrgico? *"] = "Não"
+                for header in list(values):
+                    if header.startswith((
+                        "Conduta Clínica - TUSS +",
+                        "Conduta Clínica - Quantidade",
+                        "Conduta Clínica - Anvisa +",
+                        "Conduta Clínica - Tipo de anestesia",
+                        "Conduta Clínica - Houve intercorrências",
+                        "Conduta Clínica - Tipo de intercorrência",
+                        "Conduta Clínica - Justifique",
+                    )):
+                        values[header] = ""
+
+        acquired_yn = value_to_text(
+            values.get("Condição Adquirida - Paciente adquiriu alguma condição? *")
+        ).lower()
+        if acquired_yn.startswith("s"):
+            acquired_condition = value_to_text(
+                values.get("Condição Adquirida - Condição adquirida * (cond.)")
+            )
+            acquired_characterization = next(
+                (
+                    value_to_text(raw)
+                    for header, raw in values.items()
+                    if header.startswith("Condição Adquirida - Caracterização clínica da condição * (cond.)")
+                    and not is_blank(raw)
+                ),
+                "",
+            )
+            acquired_date = next(
+                (
+                    value_to_text(raw)
+                    for header, raw in values.items()
+                    if header.startswith("Condição Adquirida - Data da condição adquirida * (cond.)")
+                    and not is_blank(raw)
+                ),
+                "",
+            )
+            if not (acquired_condition and acquired_characterization and acquired_date):
+                values["Condição Adquirida - Paciente adquiriu alguma condição? *"] = "Não"
+                for header in list(values):
+                    if header.startswith("Condição Adquirida - ") and header != "Condição Adquirida - Paciente adquiriu alguma condição? *":
+                        values[header] = ""
+
+        auditor_defaults = {
+            "Parecer do Auditor - Pertinência Técnica da Internação *": "Sim",
+            "Parecer do Auditor - Pertinência Técnica da permanência hospitalar *": "Sim",
+            "Parecer do Auditor - Paciente permanece internado? *": "Sim",
+            "Parecer do Auditor - Programação de alta * (cond.)": "Sem programação de alta",
+        }
+        for field, default in auditor_defaults.items():
+            if is_blank(values.get(field)):
+                values[field] = default
+
+        discharge = re.search(
+            r"\balta\s+(\d{2})/(\d{2})(?:/(\d{2,4}))?\s+(\d{1,2}:\d{2})",
+            evolution_text,
+            flags=re.IGNORECASE,
+        )
+        if discharge:
+            day, month, year, hour = discharge.groups()
+            if not year:
+                year = str(dt.date.today().year)
+            elif len(year) == 2:
+                year = "20" + year
+            values["Parecer do Auditor - Paciente permanece internado? *"] = "Não"
+            values["Parecer do Auditor - Selecione o desfecho assistencial * (cond.)"] = "Alta melhorada"
+            values["Parecer do Auditor - Data do desfecho * (cond.)"] = f"{day}/{month}/{year}"
+            values["Parecer do Auditor - Hora do desfecho * (cond.)"] = hour
+        elif value_to_text(values.get("Parecer do Auditor - Paciente permanece internado? *")).lower().startswith("n"):
+            required_discharge = [
+                "Parecer do Auditor - Selecione o desfecho assistencial * (cond.)",
+                "Parecer do Auditor - Data do desfecho * (cond.)",
+                "Parecer do Auditor - Hora do desfecho * (cond.)",
+            ]
+            if any(is_blank(values.get(field)) for field in required_discharge):
+                values["Parecer do Auditor - Paciente permanece internado? *"] = "Sim"
+                for field in required_discharge:
+                    values[field] = ""
         patient = ClinicalPatient(
             row_number=row,
             senha=senha,
@@ -543,6 +690,7 @@ def process_patients(
     only_password: str | None = None,
     limit: int | None = None,
     usar_defaults_obrigatorios: bool = False,
+    stop_on_error: bool = False,
     progress_callback: Callable[[str, QueuePatient, PatientResult | None], None] | None = None,
 ) -> list[PatientResult]:
     executor = DryRunExecutor() if dry_run else SalusExecutor(usar_defaults_obrigatorios=usar_defaults_obrigatorios)
@@ -635,6 +783,8 @@ def process_patients(
                 results.append(result)
                 if progress_callback:
                     progress_callback("fim", queue_patient, result)
+                if stop_on_error:
+                    break
                 continue
 
         result = build_patient_result(
@@ -648,6 +798,8 @@ def process_patients(
         results.append(result)
         if progress_callback:
             progress_callback("fim", queue_patient, result)
+        if stop_on_error and result.status == "ERRO":
+            break
 
     return results
 

@@ -2,7 +2,7 @@
 """Tela web local do Robo Sallus.
 
 Este app nao depende de tkinter. Ele abre uma pagina local no navegador com:
-- botoes Etapa 1 e Etapa 2
+- botao Novo dia, Etapa 1 e lancamento automatico no Salus
 - cards de contagem
 - paciente/senha em processamento
 - log de execucao
@@ -28,8 +28,10 @@ from etapa2_lancar_evolucao_salus import (
     read_clinical,
     read_queue,
     read_successful_passwords,
+    value_to_text,
     write_report,
 )
+from salus_cdp import navigate_salus
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -49,17 +51,19 @@ def newest(patterns: str | tuple[str, ...], fallback: str) -> Path:
 
 
 def default_state() -> dict:
+    today = dt.date.today().strftime("%d_%m_%Y")
     return {
         "running": False,
         "status": "Pronto",
         "current_patient": "Nenhum paciente em execucao",
         "current_password": "-",
         "processed_now": 0,
+        "launch_rows": [],
         "logs": [],
         "files": {
             "fila": str(newest(("fila_salus_*.xlsx", "pacientes_sirio_libanes_*.xlsx"), "fila_salus_DATA.xlsx")),
-            "clinica": str(newest(("data_base_lancamento_*.xlsx", "data_base_lantamento_*.xlsx", "preenchimento_evolucao_clinica_*_colorido.xlsx"), "data_base_lancamento_DATA.xlsx")),
-            "relatorio": str(EXPORTS / "data_base_lancamento_16_07_2026.xlsx"),
+            "clinica": str(newest(("data_base_lancar_*.xlsx", "data_base_lancar-*.xlsx", "data_base_lancamento_*.xlsx", "data_base_lantamento_*.xlsx", "preenchimento_evolucao_clinica_*_colorido.xlsx"), "data_base_lancamento_DATA.xlsx")),
+            "relatorio": str(EXPORTS / f"relatorio_lancamentos_{today}.xlsx"),
         },
         "cards": {
             "salus": "-",
@@ -143,30 +147,136 @@ def run_etapa1_worker() -> None:
         set_state(running=False)
 
 
-def run_etapa2_worker(real_run: bool, only_password: str | None) -> None:
+def run_new_day_worker() -> None:
+    try:
+        date_label = dt.date.today().strftime("%d_%m_%Y")
+        queue_output = EXPORTS / f"fila_salus_{date_label}.xlsx"
+        clinical_output = EXPORTS / f"data_base_lancamento_{date_label}.xlsx"
+        report_output = EXPORTS / f"relatorio_lancamentos_{date_label}.xlsx"
+        cmd = [sys.executable, str(ROOT / "scripts" / "atualizar_novo_dia.py")]
+
+        log("Novo dia iniciado: baixando a fila antes de arquivar os arquivos atuais.")
+        completed = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, check=False)
+        if completed.stdout.strip():
+            for line in completed.stdout.strip().splitlines():
+                log(line)
+        if completed.stderr.strip():
+            for line in completed.stderr.strip().splitlines():
+                log(line)
+        if completed.returncode != 0:
+            set_state(status=f"Novo dia falhou com codigo {completed.returncode}")
+            log("ERRO: nenhum arquivo foi substituido se a fila nao foi baixada.")
+            return
+
+        with LOCK:
+            STATE["files"] = {
+                "fila": str(queue_output),
+                "clinica": str(clinical_output),
+                "relatorio": str(report_output),
+            }
+            STATE["processed_now"] = 0
+            STATE["current_patient"] = "Nenhum paciente em execucao"
+            STATE["current_password"] = "-"
+            STATE["launch_rows"] = []
+        refresh_cards()
+        set_state(status="Novo dia concluido")
+        log(f"Novo dia pronto: {len(read_queue(queue_output))} pacientes.")
+    except Exception as exc:
+        set_state(status="Erro ao iniciar novo dia")
+        log(f"ERRO: {exc}")
+    finally:
+        set_state(running=False)
+
+
+def run_etapa2_worker(only_password: str | None, batch_limit: int | None) -> None:
     try:
         files = STATE["files"].copy()
         fila = Path(files["fila"])
         clinica = Path(files["clinica"])
         relatorio = Path(files["relatorio"])
-        mode = "REAL" if real_run else "DRY-RUN"
-        log(f"Etapa 2 iniciada em modo {mode}.")
+        log("Etapa 2 iniciada: lancamento automatico direto no Salus.")
 
         queue_patients = read_queue(fila)
         clinical_by_password, field_meta, field_headers = read_clinical(clinica)
         successful_passwords = read_successful_passwords(relatorio)
+        attempted_passwords: set[str] = set(successful_passwords)
+        for senha, rows in clinical_by_password.items():
+            if any(value_to_text(row.values.get("Lançamento Salus - Status")) for row in rows):
+                attempted_passwords.add(senha)
+
+        # Somente pacientes com evolução textual, ainda não tentados, entram no lote.
+        eligible_passwords = {
+            senha
+            for senha, rows in clinical_by_password.items()
+            if len(rows) == 1
+            and value_to_text(rows[0].values.get("evolucao")).strip()
+            and senha not in attempted_passwords
+        }
+        queue_patients = [
+            patient for patient in queue_patients
+            if patient.senha in eligible_passwords
+            and (not only_password or patient.senha == only_password)
+        ]
+        if batch_limit is not None:
+            queue_patients = queue_patients[:batch_limit]
+        if not queue_patients:
+            raise RuntimeError(
+                "Nenhum paciente pendente com evolução foi encontrado na Planilha Clínica selecionada."
+            )
+        target_passwords = {
+            patient.senha
+            for patient in queue_patients
+            if not only_password or patient.senha == only_password
+        }
+        missing_ids = sorted(
+            senha
+            for senha in target_passwords
+            if senha in clinical_by_password
+            and len(clinical_by_password[senha]) == 1
+            and not clinical_by_password[senha][0].id_internacao
+        )
+        if missing_ids:
+            sample = ", ".join(missing_ids[:5])
+            raise RuntimeError(
+                f"A base clinica possui {len(missing_ids)} paciente(s) sem ID de internacao "
+                f"({sample}). Clique em 'Novo dia' com o Salus aberto e autenticado para "
+                "regenerar a base antes do lancamento."
+            )
         processed_count = 0
+        started_at: dict[str, dt.datetime] = {}
 
         def progress(event: str, patient: QueuePatient, result: PatientResult | None) -> None:
             nonlocal processed_count
             if event == "inicio":
-                set_state(
-                    current_patient=patient.nome or "-",
-                    current_password=patient.senha,
-                )
+                started_at[patient.senha] = dt.datetime.now()
+                with LOCK:
+                    STATE["current_patient"] = patient.nome or "-"
+                    STATE["current_password"] = patient.senha
+                    STATE["launch_rows"].append({
+                        "nome": patient.nome or "-",
+                        "senha": patient.senha,
+                        "iniciais": patient.iniciais or "-",
+                        "inicio": started_at[patient.senha].isoformat(),
+                        "tempo": "0s",
+                        "situacao": "Em lançamento",
+                    })
             elif event == "fim" and result:
                 processed_count += 1
-                set_state(processed_now=processed_count)
+                elapsed = dt.datetime.now() - started_at.get(patient.senha, dt.datetime.now())
+                total_seconds = max(0, int(elapsed.total_seconds()))
+                elapsed_text = f"{total_seconds // 60}m {total_seconds % 60:02d}s" if total_seconds >= 60 else f"{total_seconds}s"
+                with LOCK:
+                    STATE["processed_now"] = processed_count
+                    for row in reversed(STATE["launch_rows"]):
+                        if row["senha"] == patient.senha and row["situacao"] == "Em lançamento":
+                            row["tempo"] = elapsed_text
+                            row["situacao"] = "Concluído" if result.status not in {"ERRO", "PULADO"} else result.status
+                            break
+                    if result.status not in {"JA_LANCADO", "PULADO"}:
+                        try:
+                            STATE["cards"]["faltam"] = max(0, int(STATE["cards"]["faltam"]) - 1)
+                        except (TypeError, ValueError):
+                            pass
                 log(f"{result.senha} - {result.nome} - {result.status}: {result.mensagem}")
 
         results = process_patients(
@@ -174,9 +284,11 @@ def run_etapa2_worker(real_run: bool, only_password: str | None) -> None:
             clinical_by_password=clinical_by_password,
             field_meta=field_meta,
             field_headers=field_headers,
-            successful_passwords=successful_passwords,
-            dry_run=not real_run,
+            successful_passwords=attempted_passwords,
+            dry_run=False,
             only_password=only_password,
+            usar_defaults_obrigatorios=True,
+            stop_on_error=True,
             progress_callback=progress,
         )
         write_report(results, relatorio)
@@ -225,9 +337,17 @@ HTML = r"""<!doctype html>
     }
     .files {
       display: grid;
-      grid-template-columns: 150px 1fr;
-      gap: 10px 12px;
+      grid-template-columns: 140px 1fr;
+      gap: 5px 10px;
       align-items: center;
+      padding: 9px 14px;
+      margin-bottom: 10px;
+    }
+    .files label { font-size: 13px; }
+    .files input[type="text"] {
+      padding: 6px 10px;
+      font-size: 13px;
+      height: 32px;
     }
     label { font-weight: 650; color: #374151; }
     input[type="text"] {
@@ -263,17 +383,20 @@ HTML = r"""<!doctype html>
     .card .title { color: var(--muted); font-size: 13px; }
     .card .value { color: var(--blue); font-weight: 800; font-size: 30px; margin-top: 8px; }
     .current {
-      display: grid;
-      grid-template-columns: 1fr 180px;
-      gap: 16px;
       background: #eaf2f8;
       border: 1px solid #c7d9e8;
       border-radius: 8px;
-      padding: 16px;
+      padding: 12px 14px;
       margin-bottom: 16px;
     }
-    .current .title { color: #506070; font-size: 13px; }
-    .current .value { color: #17324d; font-size: 24px; font-weight: 800; margin-top: 4px; }
+    .launch-title { color: #506070; font-size: 13px; font-weight: 750; margin-bottom: 7px; }
+    .launch-row { display: grid; grid-template-columns: minmax(260px, 1fr) 120px 100px 120px 110px; gap: 10px; padding: 7px 4px; border-top: 1px solid #c7d9e8; align-items: center; }
+    .launch-row:first-child { border-top: 0; }
+    .launch-name { color: #17324d; font-weight: 750; }
+    .launch-meta { color: #506070; font-size: 13px; }
+    .launch-status { color: #166534; font-weight: 800; }
+    .launch-status.running { color: #1f4e78; }
+    .launch-status.error { color: var(--danger); }
     .status { color: var(--muted); margin-bottom: 8px; }
     pre {
       margin: 0;
@@ -289,7 +412,7 @@ HTML = r"""<!doctype html>
     }
     @media (max-width: 900px) {
       .cards { grid-template-columns: repeat(2, 1fr); }
-      .current { grid-template-columns: 1fr; }
+      .launch-row { grid-template-columns: 1fr 1fr; }
       .files { grid-template-columns: 1fr; }
     }
   </style>
@@ -297,7 +420,7 @@ HTML = r"""<!doctype html>
 <body>
   <main>
     <h1>Robo Sallus</h1>
-    <p class="sub">Etapa 1 baixa a fila. Etapa 2 confere senha por senha e prepara ou lança a evolução.</p>
+    <p class="sub">Novo dia arquiva o lote anterior e prepara as listas. Etapa 2 lança automaticamente as evoluções no Salus.</p>
 
     <section class="panel files">
       <label>Fila Salus</label>
@@ -309,12 +432,20 @@ HTML = r"""<!doctype html>
     </section>
 
     <section class="panel actions">
+      <button id="novoDia" onclick="startNewDay()">Novo dia</button>
       <button id="etapa1" onclick="startEtapa1()">Etapa 1: Baixar Fila Salus</button>
-      <button id="etapa2" onclick="startEtapa2()">Etapa 2: Lançar Evolução</button>
+      <button id="etapa2" onclick="startEtapa2()">Etapa 2: Lançar Automaticamente no Salus</button>
+      <button id="limparSalus" class="secondary" onclick="clearSalus()">Limpar tela do Salus</button>
       <button class="secondary" onclick="refreshCards()">Atualizar Cards</button>
       <label style="margin-left: 8px;">Somente senha</label>
       <input id="senha" type="text" style="width: 140px;">
-      <label class="check"><input id="real" type="checkbox"> Executar no Salus real</label>
+      <label>Lote</label>
+      <select id="batch_limit" style="height: 39px; border: 1px solid var(--line); border-radius: 6px; padding: 0 10px; background: #fff; font-weight: 700;">
+        <option value="3">3 pacientes</option>
+        <option value="10">10 pacientes</option>
+        <option value="20">20 pacientes</option>
+        <option value="all">Todos</option>
+      </select>
     </section>
 
     <section class="cards">
@@ -326,14 +457,8 @@ HTML = r"""<!doctype html>
     </section>
 
     <section class="current">
-      <div>
-        <div class="title">Paciente atual</div>
-        <div id="current_patient" class="value">Nenhum paciente em execução</div>
-      </div>
-      <div>
-        <div class="title">Senha</div>
-        <div id="current_password" class="value">-</div>
-      </div>
+      <div class="launch-title">Pacientes em lançamento</div>
+      <div id="launch_rows"><div class="launch-meta">Nenhum paciente em execução</div></div>
     </section>
 
     <div id="status" class="status">Pronto</div>
@@ -375,18 +500,34 @@ HTML = r"""<!doctype html>
       await poll();
     }
 
+    async function startNewDay() {
+      if (!confirm('Iniciar novo dia? As planilhas atuais serão movidas para a pasta de arquivo após a nova fila ser baixada.')) return;
+      await api('/api/novo-dia', {method: 'POST'});
+      await poll();
+    }
+
     async function startEtapa2() {
       await saveFiles();
-      const real = document.getElementById('real').checked;
-      if (real && !confirm('Confirma execução real no Salus?')) return;
+      const senha = document.getElementById('senha').value.trim();
+      const batchValue = document.getElementById('batch_limit').value;
+      const batchLimit = batchValue === 'all' ? null : Number(batchValue);
+      const escopo = senha ? ` somente para a senha ${senha}` : ' para todos os pacientes pendentes';
+      const lote = batchLimit ? `, limitado a ${batchLimit} paciente(s)` : '';
+      if (!confirm(`Confirma o lançamento automático direto no Salus${escopo}${lote}?`)) return;
       await api('/api/etapa2', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
-          real_run: real,
-          only_password: document.getElementById('senha').value.trim()
+          only_password: senha,
+          batch_limit: batchLimit
         })
       });
+      await poll();
+    }
+
+    async function clearSalus() {
+      if (!confirm('Limpar a tela do paciente atual e voltar para a lista de internações?')) return;
+      await api('/api/limpar-salus', {method: 'POST'});
       await poll();
     }
 
@@ -400,12 +541,31 @@ HTML = r"""<!doctype html>
       document.getElementById('encontrados').textContent = state.cards.encontrados;
       document.getElementById('faltam').textContent = state.cards.faltam;
       document.getElementById('processed').textContent = state.processed_now;
-      document.getElementById('current_patient').textContent = state.current_patient;
-      document.getElementById('current_password').textContent = state.current_password;
+      const launchRows = document.getElementById('launch_rows');
+      if (!state.launch_rows.length) {
+        launchRows.innerHTML = '<div class="launch-meta">Nenhum paciente em execução</div>';
+      } else {
+        const now = Date.now();
+        launchRows.innerHTML = state.launch_rows.map(row => {
+          let tempo = row.tempo;
+          if (row.situacao === 'Em lançamento') {
+            const seconds = Math.max(0, Math.floor((now - new Date(row.inicio).getTime()) / 1000));
+            tempo = seconds >= 60 ? `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, '0')}s` : `${seconds}s`;
+          }
+          const statusClass = row.situacao === 'Em lançamento' ? 'running' : (row.situacao === 'Concluído' ? '' : 'error');
+          return `<div class="launch-row"><div class="launch-name">${escapeHtml(row.nome)}</div><div class="launch-meta">Senha: ${escapeHtml(row.senha)}</div><div class="launch-meta">Iniciais: ${escapeHtml(row.iniciais)}</div><div class="launch-meta">${tempo}</div><div class="launch-status ${statusClass}">${row.situacao}</div></div>`;
+        }).join('');
+      }
       document.getElementById('status').textContent = state.status;
       document.getElementById('logs').textContent = state.logs.join('\n');
+      document.getElementById('novoDia').disabled = state.running;
       document.getElementById('etapa1').disabled = state.running;
       document.getElementById('etapa2').disabled = state.running;
+      document.getElementById('limparSalus').disabled = state.running;
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char]));
     }
 
     setInterval(poll, 1200);
@@ -465,6 +625,18 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"ok": True, "cards": cards})
                 return
 
+            if path == "/api/novo-dia":
+                with LOCK:
+                    if STATE["running"]:
+                        self._send_json({"error": "Ja existe uma etapa em execucao."}, 409)
+                        return
+                    STATE["running"] = True
+                    STATE["processed_now"] = 0
+                    STATE["status"] = "Iniciando novo dia"
+                threading.Thread(target=run_new_day_worker, daemon=True).start()
+                self._send_json({"ok": True})
+                return
+
             if path == "/api/etapa1":
                 with LOCK:
                     if STATE["running"]:
@@ -488,11 +660,30 @@ class Handler(BaseHTTPRequestHandler):
                     STATE["status"] = "Executando Etapa 2"
                     STATE["current_patient"] = "Iniciando..."
                     STATE["current_password"] = "-"
+                    STATE["launch_rows"] = []
                 threading.Thread(
                     target=run_etapa2_worker,
-                    args=(bool(data.get("real_run")), data.get("only_password") or None),
+                    args=(
+                        data.get("only_password") or None,
+                        int(data["batch_limit"]) if data.get("batch_limit") is not None else None,
+                    ),
                     daemon=True,
                 ).start()
+                self._send_json({"ok": True})
+                return
+
+            if path == "/api/limpar-salus":
+                with LOCK:
+                    if STATE["running"]:
+                        self._send_json({"error": "Aguarde o lançamento atual terminar antes de limpar a tela."}, 409)
+                        return
+                navigate_salus("https://salus.orizon.com.br/salus/gestao-internacao")
+                with LOCK:
+                    STATE["current_patient"] = "Nenhum paciente em execução"
+                    STATE["current_password"] = "-"
+                    STATE["launch_rows"] = []
+                    STATE["status"] = "Tela do Salus limpa"
+                log("Tela do Salus limpa; retorno à lista de internações.")
                 self._send_json({"ok": True})
                 return
 
