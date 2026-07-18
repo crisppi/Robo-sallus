@@ -128,6 +128,14 @@ def respiratory(text: str) -> dict[str, str]:
             result["Exame Físico - Detalhamento do suporte respiratório * (cond.)"] = "Cateter O2"
     elif re.search(r"\b(?:ar ambiente|eupneic[oa] em aa)\b", normalized):
         result["Exame Físico - Suporte respiratório *"] = "Ar ambiente"
+
+    # A descrição do estado respiratório atual prevalece sobre menções
+    # históricas (ex.: IOT como possibilidade terapêutica ou CPAP domiciliar).
+    if re.search(r"\b(?:eupneic[oa](?:\s+em\s+aa)?|em\s+ar\s+ambiente)\b", normalized):
+        result["Exame Físico - Via respiratória *"] = "Normal"
+    if re.search(r"\b(?:eupneic[oa]\s+em\s+aa|em\s+ar\s+ambiente)\b", normalized):
+        result["Exame Físico - Suporte respiratório *"] = "Ar ambiente"
+        result.pop("Exame Físico - Detalhamento do suporte respiratório * (cond.)", None)
     return result
 
 
@@ -257,6 +265,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Preenche a base a partir da coluna evolucao.")
     parser.add_argument("entrada", type=Path)
     parser.add_argument("saida", type=Path)
+    parser.add_argument(
+        "--somente-vazios",
+        action="store_true",
+        help="Preenche apenas células vazias, preservando valores já revisados.",
+    )
     args = parser.parse_args()
 
     workbook = load_workbook(args.entrada)
@@ -277,6 +290,10 @@ def main() -> int:
         for header, value in values.items():
             column = headers.get(header)
             if column and value not in (None, ""):
+                if args.somente_vazios:
+                    current = sheet.cell(row, column).value
+                    if current is not None and str(current).strip():
+                        continue
                 sheet.cell(row, column).value = value
                 row_writes += 1
         if row_writes:

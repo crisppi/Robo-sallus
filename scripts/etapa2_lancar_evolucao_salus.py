@@ -41,6 +41,10 @@ IDENTITY_HEADERS = {
 }
 
 SUCCESS_STATUSES = {"SUCESSO", "SUCESSO_COM_ALERTA", "SUCESSO_MANUAL"}
+
+
+class AwaitingCidError(RuntimeError):
+    pass
 MULTIPLE_TYPES = {"LISTA_MULTIPLA"}
 MULTIPLE_CONTROLS = {"CHECKBOX_MULTI", "MULTISELECT"}
 YES_VALUES = {"sim", "s", "yes", "y", "true", "1"}
@@ -407,36 +411,12 @@ def read_clinical(path: Path) -> tuple[dict[str, list[ClinicalPatient]], dict[st
                     )):
                         values[header] = ""
 
-        acquired_yn = value_to_text(
-            values.get("Condição Adquirida - Paciente adquiriu alguma condição? *")
-        ).lower()
-        if acquired_yn.startswith("s"):
-            acquired_condition = value_to_text(
-                values.get("Condição Adquirida - Condição adquirida * (cond.)")
-            )
-            acquired_characterization = next(
-                (
-                    value_to_text(raw)
-                    for header, raw in values.items()
-                    if header.startswith("Condição Adquirida - Caracterização clínica da condição * (cond.)")
-                    and not is_blank(raw)
-                ),
-                "",
-            )
-            acquired_date = next(
-                (
-                    value_to_text(raw)
-                    for header, raw in values.items()
-                    if header.startswith("Condição Adquirida - Data da condição adquirida * (cond.)")
-                    and not is_blank(raw)
-                ),
-                "",
-            )
-            if not (acquired_condition and acquired_characterization and acquired_date):
-                values["Condição Adquirida - Paciente adquiriu alguma condição? *"] = "Não"
-                for header in list(values):
-                    if header.startswith("Condição Adquirida - ") and header != "Condição Adquirida - Paciente adquiriu alguma condição? *":
-                        values[header] = ""
+        # Regra operacional fixa: a automação nunca marca condição adquirida.
+        # Qualquer exceção deve ser lançada manualmente fora do robô.
+        values["Condição Adquirida - Paciente adquiriu alguma condição? *"] = "Não"
+        for header in list(values):
+            if header.startswith("Condição Adquirida - ") and header != "Condição Adquirida - Paciente adquiriu alguma condição? *":
+                values[header] = ""
 
         auditor_defaults = {
             "Parecer do Auditor - Pertinência Técnica da Internação *": "Sim",
@@ -625,6 +605,10 @@ class SalusExecutor:
             confirmar=True,
             usar_defaults_obrigatorios=self.usar_defaults_obrigatorios,
         )
+        if result.get("missingCid"):
+            raise AwaitingCidError(
+                "Demais páginas preenchidas; falta apenas definir o CID antes da confirmação."
+            )
         if not result.get("confirmEnabled"):
             raise RuntimeError("Tela HTML preenchida, mas Confirmar evolucao permaneceu desabilitado.")
         for field in fields:
@@ -769,6 +753,21 @@ def process_patients(
         if not any(field.status == "ERRO" for field in prepared_fields):
             try:
                 prepared_fields = executor.lancar(queue_patient, clinical_patient, prepared_fields)
+            except AwaitingCidError as exc:
+                result = PatientResult(
+                    senha=queue_patient.senha,
+                    nome=queue_patient.nome or clinical_patient.nome,
+                    iniciais=queue_patient.iniciais or clinical_patient.iniciais,
+                    status="AGUARDANDO_CID",
+                    mensagem=str(exc),
+                    campos_preenchidos=[],
+                    campos_ignorados=ignored_fields,
+                    campos_com_erro=[],
+                )
+                results.append(result)
+                if progress_callback:
+                    progress_callback("fim", queue_patient, result)
+                continue
             except Exception as exc:
                 result = PatientResult(
                     senha=queue_patient.senha,

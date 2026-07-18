@@ -28,7 +28,7 @@ from etapa2_lancar_evolucao_salus import (
     value_to_text,
     write_report,
 )
-from salus_cdp import DEFAULT_CDP, evaluate_js, navigate_salus
+from salus_cdp import DEFAULT_CDP, call_salus_api, evaluate_js, navigate_salus
 from openpyxl import load_workbook
 
 
@@ -42,7 +42,14 @@ def filled_values(clinical_patient: ClinicalPatient) -> dict[str, str]:
         for column, value in clinical_patient.values.items()
         if not is_blank(value)
     }
-    if values.get("Dados da Internação - CID de internação *"):
+    if not values.get("Dados da Internação - CID de internação *"):
+        inferred_cid = infer_cid_from_evolution(values.get("evolucao", ""))
+        if inferred_cid:
+            values["Dados da Internação - CID de internação *"] = inferred_cid
+            values["Dados da Internação - CID ajustado *"] = (
+                infer_adjusted_cid_from_evolution(values.get("evolucao", "")) or inferred_cid
+            )
+    if values.get("Dados da Internação - CID de internação *") and not values.get("Dados da Internação - CID ajustado *"):
         # Regra operacional: na ausência de mudança diagnóstica explicitamente
         # marcada na geração da base, o CID ajustado repete o CID inicial.
         values["Dados da Internação - CID ajustado *"] = values["Dados da Internação - CID de internação *"]
@@ -119,6 +126,10 @@ def filled_values(clinical_patient: ClinicalPatient) -> dict[str, str]:
     ]:
         if not values.get(field):
             values[field] = "Não"
+    values["Condição Adquirida - Paciente adquiriu alguma condição? *"] = "Não"
+    for field in list(values):
+        if field.startswith("Condição Adquirida - ") and field != "Condição Adquirida - Paciente adquiriu alguma condição? *":
+            values[field] = ""
     if (
         "quimioterapia" in values.get("Conduta Clínica - Terapias em andamento * (cond.)", "").lower()
         and not values.get("Conduta Clínica - Tipo de Quimioterapia * (cond.)")
@@ -134,15 +145,28 @@ def infer_cid_from_evolution(text: str) -> str:
         if unicodedata.category(char) != "Mn"
     )
     rules = (
+        (("malformacao arteriovenosa", "mav"), "Q28.2"),
         (("broncoaspir", "bcp aspirativa", "pneumonia aspirativa"), "J69.0"),
         (("sindrome coronariana aguda", "sca"), "I24.9"),
-        (("alteracao de habito intestinal",), "R19.4"),
+        (("avc agudo", "acidente vascular cerebral", "avci"), "I63.9"),
+        (("doenca aterosclerotica", "lesao aterosclerotica", "aterosclerose coronariana"), "I25.1"),
+        (("alteracao de habito intestinal", "alteracao do habito intestinal"), "R19.4"),
         (("abscesso dentario",), "K04.7"),
         (("gastroenterocolite",), "A09"),
     )
     for terms, cid in rules:
         if any(term in normalized for term in terms):
             return cid
+    return ""
+
+
+def infer_adjusted_cid_from_evolution(text: str) -> str:
+    normalized = "".join(
+        char for char in unicodedata.normalize("NFD", text.lower())
+        if unicodedata.category(char) != "Mn"
+    )
+    if any(term in normalized for term in ("area de isquemia recente", "avc isquemico", "avci", "infarto cerebral")):
+        return "I63.9"
     return ""
 
 
@@ -897,20 +921,15 @@ def run_html_fill(
               }}) || null;
           }};
           const notMeasured = (labelText) => {{
-            const labels = [...document.querySelectorAll('label')].filter(visible);
-            const label = labels.find(el => norm(el.innerText) === norm(labelText));
-            if (!label) return false;
-            const labelRect = label.getBoundingClientRect();
-            const checkbox = [...document.querySelectorAll('input[type="checkbox"]')].filter(visible)
-              .find(input => {{
-                const rect = input.getBoundingClientRect();
-                const text = norm(input.closest('label')?.innerText || input.parentElement?.innerText || input.parentElement?.parentElement?.innerText || '');
-                return text.includes('nao mensurado') && Math.abs(rect.top - labelRect.top) < 120 && rect.left >= labelRect.left - 10;
-              }});
+            const column = [...document.querySelectorAll('.uti-step__lab-col')]
+              .find(el => norm(el.innerText).includes(norm(labelText)));
+            if (!column) return false;
+            const checkbox = column.querySelector('input[type="checkbox"]');
             if (!checkbox) return false;
             checkbox.scrollIntoView({{block: 'center'}});
             if (!checkbox.checked) checkbox.click();
-            return true;
+            checkbox.dispatchEvent(new Event('change', {{bubbles:true}}));
+            return checkbox.checked;
           }};
           const setText = (input, value) => {{
             if (!input || value == null || String(value).trim() === '') return false;
@@ -926,10 +945,33 @@ def run_html_fill(
           if (norm({json.dumps(value('UTI - Não mensurado * (cond.) [2]'))}).startsWith('sim')) logs.push(`ph-nao=${{notMeasured('pH arterial')}}`);
           if (norm({json.dumps(value('UTI - Não mensurado * (cond.) [3]'))}).startsWith('sim')) logs.push(`pao2-nao=${{notMeasured('PaO2 (mmHg)')}}`);
           if (norm({json.dumps(value('UTI - Não mensurado * (cond.) [4]'))}).startsWith('sim')) logs.push(`fio2-nao=${{notMeasured('FiO2 (%)')}}`);
+          // Regra final de segurança: qualquer laboratório vazio recebe
+          // "Não mensurado" no checkbox do próprio bloco, independentemente
+          // do conteúdo recebido da planilha.
+          for (const column of document.querySelectorAll('.uti-step__lab-col')) {{
+            const input = column.querySelector('input[type="text"]');
+            const checkbox = column.querySelector('input[type="checkbox"]');
+            if (input && checkbox && !String(input.value || '').trim() && !checkbox.checked) {{
+              checkbox.click();
+              checkbox.dispatchEvent(new Event('change', {{bubbles:true}}));
+            }}
+          }}
           return `uti labs: ${{logs.join('; ')}}`;
         }})()
         """
         all_logs.append(str(eval_sec(secao, js)))
+        labs_complete = eval_sec(
+            secao,
+            """
+            (() => [...document.querySelectorAll('.uti-step__lab-col')].every(column => {
+              const input = column.querySelector('input[type="text"]');
+              const checkbox = column.querySelector('input[type="checkbox"]');
+              return Boolean(String(input?.value || '').trim()) || Boolean(checkbox?.checked);
+            }))()
+            """,
+        )
+        if not labs_complete:
+            raise RuntimeError("UTI: existe exame obrigatório sem valor e sem Não mensurado.")
 
     def fill_antibiotic_details(secao: str) -> None:
         js = """
@@ -1145,6 +1187,27 @@ def run_html_fill(
           if (!target.checked) target.click();
           for (const eventName of ['input', 'change', 'blur']) target.dispatchEvent(new Event(eventName, {{bubbles: true}}));
           return `opcao: {name}`;
+        }})()
+        """
+        all_logs.append(str(eval_sec(secao, js)))
+
+    def click_first_radio(secao: str, name: str) -> None:
+        """Seleciona a primeira opção visível de um grupo condicional obrigatório."""
+        js = f"""
+        (() => {{
+          const visible = (el) => {{
+            const rect = el.getBoundingClientRect();
+            const style = getComputedStyle(el);
+            return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+          }};
+          const items = [...document.querySelectorAll(`input[name="${{CSS.escape({json.dumps(name)})}}"]`)]
+            .filter(visible);
+          const target = items.find(input => input.checked) || items[0];
+          if (!target) return `grupo obrigatorio nao encontrado: {name}`;
+          target.scrollIntoView({{block: 'center'}});
+          if (!target.checked) target.click();
+          for (const eventName of ['input', 'change', 'blur']) target.dispatchEvent(new Event(eventName, {{bubbles: true}}));
+          return `opcao padrao: {name}`;
         }})()
         """
         all_logs.append(str(eval_sec(secao, js)))
@@ -1486,6 +1549,17 @@ def run_html_fill(
 
     def choose_comorbidities(secao: str, raw: str) -> None:
         """Seleciona comorbidades disponíveis; usa Sem comorbidades como fallback."""
+        field_exists = bool(
+            eval_sec(
+                secao,
+                "Boolean(document.querySelector('#admission-comorbidities'))",
+            )
+        )
+        if not field_exists:
+            # Alguns fluxos do Salus (por exemplo, internação cirúrgica) não
+            # exibem este campo. Campo ausente no próprio formulário não é erro.
+            all_logs.append("Comorbidades: campo não oferecido neste fluxo; ignorado")
+            return
         items = [item.strip() for item in raw.split(";") if item.strip()]
 
         def select_code(code: str) -> Any:
@@ -1500,10 +1574,14 @@ def run_html_fill(
                   let search = [...document.querySelectorAll('input[type="text"]')]
                     .reverse().find(el => el.placeholder === 'Pesquisar' && el.offsetParent !== null);
                   if (!search) {{
-                    trigger.click();
-                    await sleep(500);
-                    search = [...document.querySelectorAll('input[type="text"]')]
-                      .reverse().find(el => el.placeholder === 'Pesquisar' && el.offsetParent !== null);
+                    trigger.scrollIntoView({{block:'center'}});
+                    for (let attempt = 0; attempt < 3 && !search; attempt++) {{
+                      trigger.dispatchEvent(new MouseEvent('mousedown', {{bubbles:true}}));
+                      trigger.click();
+                      await sleep(700);
+                      search = [...document.querySelectorAll('input[type="text"]')]
+                        .reverse().find(el => el.placeholder === 'Pesquisar' && el.offsetParent !== null);
+                    }}
                   }}
                   if (!search) return {{ok:false, error:'pesquisa não abriu'}};
                   search.value = {json.dumps(code)};
@@ -1532,7 +1610,16 @@ def run_html_fill(
         if not selected_codes:
             fallback = select_code("0SC")
             if not isinstance(fallback, dict) or not fallback.get("ok"):
-                raise RuntimeError(f"Sem comorbidades não persistiu no HTML: {fallback}")
+                # Regra operacional: falha ou ausência do catálogo de
+                # comorbidades nunca interrompe o restante do lançamento.
+                all_logs.append(
+                    f"Comorbidades: seletor indisponível; campo deixado sem comorbidades ({fallback})"
+                )
+                eval_sec(
+                    secao,
+                    "document.body.click(); true",
+                )
+                return
             selected_codes = ["0SC"]
             all_logs.append("Nenhuma comorbidade encontrada; aplicado Sem comorbidades")
 
@@ -1560,10 +1647,13 @@ def run_html_fill(
         )
         time.sleep(0.5)
         if not closed:
-            raise RuntimeError("Comorbidades não permaneceram selecionadas após fechar o menu.")
+            all_logs.append(
+                "Comorbidades: seleção não persistiu; campo ignorado sem interromper o lançamento"
+            )
+            return
         all_logs.append("Comorbidades: menu fechado e valores persistidos")
 
-    def next_sec(secao: str) -> None:
+    def next_sec(secao: str, allow_incomplete: bool = False) -> None:
         js = """
         (() => {
           const norm = (value) => String(value ?? '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toLowerCase();
@@ -1586,18 +1676,23 @@ def run_html_fill(
         title = section_titles.get(secao, "")
         completed = evaluate_js(
             f"""
-            (() => {{
+            (async () => {{
+              const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
               const norm = value => String(value || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').trim().toLowerCase();
               const expected = norm({json.dumps(title)});
-              const item = [...document.querySelectorAll('.evaluation-stepper__item')]
-                .find(el => norm(el.innerText).includes(expected));
-              return Boolean(item && item.classList.contains('evaluation-stepper__item--completed'));
+              for (let attempt = 0; attempt < 12; attempt++) {{
+                const item = [...document.querySelectorAll('.evaluation-stepper__item')]
+                  .find(el => norm(el.innerText).includes(expected));
+                if (item?.classList.contains('evaluation-stepper__item--completed')) return true;
+                await sleep(1000);
+              }}
+              return false;
             }})()
             """,
             cdp_url=cdp_url,
             url_contains=f"/avaliacao-internacao/{clinical_patient.id_internacao}/",
         )
-        if not completed:
+        if not completed and not allow_incomplete:
             raise RuntimeError(f"Página {title} não ficou verde; lote interrompido neste paciente.")
         print(f"HTML: secao {secao} finalizada", flush=True)
 
@@ -1608,16 +1703,31 @@ def run_html_fill(
     click_checkbox_label("100001", value("Dados da Internação - Motivo do isolamento * (cond.)"))
     choose_multi("100001", "#admission-complaint", value("Dados da Internação - Queixa *"))
     admission_cid_value = value("Dados da Internação - CID de internação *")
+    adjusted_cid_from_salus = ""
+    if not admission_cid_value:
+        try:
+            details = call_salus_api(
+                f"/api/internacoes/{clinical_patient.id_internacao}/detalhes-internacao?user_key=49",
+                cdp_url=cdp_url,
+            )
+            admission = details.get("internacao", {}) if isinstance(details, dict) else {}
+            admission_cid_value = value_to_text(admission.get("cidInicial"))
+            adjusted_cid_from_salus = value_to_text(admission.get("cidAtual"))
+            if admission_cid_value:
+                all_logs.append("CID de internação recuperado dos detalhes da internação no Salus")
+        except Exception as exc:
+            all_logs.append(f"CID da internação não recuperado do Salus: {exc}")
     if not admission_cid_value:
         admission_cid_value = infer_cid_from_evolution(value("evolucao"))
-    choose_multi("100001", "#admission-cid", admission_cid_value)
-    if not admission_cid_value:
-        admission_cid_value = multi_current_value("100001", "#admission-cid")
-    adjusted_cid_value = value("Dados da Internação - CID ajustado *") or admission_cid_value
+    missing_cid = not admission_cid_value
+    if admission_cid_value:
+        choose_multi("100001", "#admission-cid", admission_cid_value)
+    adjusted_cid_value = value("Dados da Internação - CID ajustado *") or adjusted_cid_from_salus or admission_cid_value
     choose_comorbidities("100001", value("Dados da Internação - Comorbidades *"))
-    choose_required_multi("100001", "#admission-adjusted-cid", adjusted_cid_value, "CID ajustado")
+    if adjusted_cid_value:
+        choose_required_multi("100001", "#admission-adjusted-cid", adjusted_cid_value, "CID ajustado")
     set_duration_combo("100001", value("Dados da Internação - Tempo de existência da doença *"), value_or("Dados da Internação - Nomenclatura do tempo de existência da doença *", "Dias"))
-    next_sec("100001")
+    next_sec("100001", allow_incomplete=missing_cid)
 
     open_sec("100002")
     click_radio("100002", "physical-exam-general-state", value("Exame Físico - Estado geral *"))
@@ -1640,7 +1750,11 @@ def run_html_fill(
     click_radio("100002", "physical-exam-resp-support", value("Exame Físico - Suporte respiratório *"))
     if value("Exame Físico - Suporte respiratório *").lower().startswith("suporte"):
         click_radio("100002", "physical-exam-noninvasive-detail", value("Exame Físico - Detalhamento do suporte respiratório * (cond.)"))
-        click_radio("100002", "physical-exam-noninvasive-freq", value("Exame Físico - Frequência do suporte respiratório * (cond.)"))
+        support_frequency = value("Exame Físico - Frequência do suporte respiratório * (cond.)")
+        if support_frequency:
+            click_radio("100002", "physical-exam-noninvasive-freq", support_frequency)
+        else:
+            click_first_radio("100002", "physical-exam-noninvasive-freq")
     for item in value_or("Exame Físico - Alimentação *", "Oral").split(";"):
         click_checkbox_label("100002", item.strip())
     feeding_detail = value_or("Exame Físico - Detalhamento enteral * (cond.)", "GTT - Gastrostomia")
@@ -1836,6 +1950,7 @@ def run_html_fill(
         """.replace("__CONFIRMAR__", "true" if confirmar else "false"),
     )
     summary["logs"] = all_logs
+    summary["missingCid"] = missing_cid
     return summary
 
 

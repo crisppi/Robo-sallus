@@ -20,6 +20,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+from openpyxl import load_workbook
 
 from etapa2_lancar_evolucao_salus import (
     PatientResult,
@@ -59,6 +60,7 @@ def default_state() -> dict:
         "current_password": "-",
         "processed_now": 0,
         "launch_rows": [],
+        "pending_rows": [],
         "logs": [],
         "files": {
             "fila": str(newest(("fila_salus_*.xlsx", "pacientes_sirio_libanes_*.xlsx"), "fila_salus_DATA.xlsx")),
@@ -90,6 +92,40 @@ def set_state(**kwargs) -> None:
         STATE.update(kwargs)
 
 
+def persist_patient_status(clinica: Path, patient: QueuePatient, result: PatientResult) -> None:
+    """Grava cada resultado imediatamente para impedir relançamento da senha."""
+    if result.status in {"PULADO", "JA_LANCADO"}:
+        return
+    wb = load_workbook(clinica)
+    ws = wb["Preenchimento"] if "Preenchimento" in wb.sheetnames else wb.active
+    headers = {str(cell.value): cell.column for cell in ws[1] if cell.value}
+    senha_col = headers.get("Senha")
+    status_col = headers.get("Lançamento Salus - Status")
+    data_col = headers.get("Lançamento Salus - Data/hora")
+    mensagem_col = headers.get("Lançamento Salus - Mensagem")
+    if not senha_col or not status_col:
+        wb.close()
+        raise RuntimeError("Base sem colunas de controle do lançamento.")
+    if result.status in {"SUCESSO", "SUCESSO_COM_ALERTA", "SUCESSO_MANUAL"}:
+        status = "FINALIZADO"
+    elif result.status in {"AGUARDANDO", "AGUARDANDO_CID"}:
+        status = result.status
+    else:
+        status = "ERRO"
+    for row in range(2, ws.max_row + 1):
+        if value_to_text(ws.cell(row, senha_col).value) == patient.senha:
+            ws.cell(row, status_col).value = status
+            if data_col:
+                ws.cell(row, data_col).value = dt.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+            if mensagem_col:
+                ws.cell(row, mensagem_col).value = result.mensagem or result.status
+            wb.save(clinica)
+            wb.close()
+            return
+    wb.close()
+    raise RuntimeError(f"Senha {patient.senha} não encontrada na base de controle.")
+
+
 def calculate_cards() -> dict:
     files = STATE["files"]
     fila = Path(files["fila"])
@@ -98,26 +134,67 @@ def calculate_cards() -> dict:
 
     queue_patients = read_queue(fila) if fila.exists() else []
     clinical_by_password, _, _ = read_clinical(clinica) if clinica.exists() else ({}, {}, [])
-    successful = read_successful_passwords(relatorio)
-
     clinical_unique = {senha for senha, rows in clinical_by_password.items() if len(rows) == 1}
     queue_passwords = [patient.senha for patient in queue_patients]
     found = sum(1 for senha in queue_passwords if senha in clinical_unique)
-    missing_to_launch = sum(1 for senha in queue_passwords if senha not in successful)
+    finalized_statuses = {
+        "FINALIZADO", "SUCESSO", "SUCESSO_COM_ALERTA", "SUCESSO_MANUAL", "JA_LANCADO"
+    }
+    eligible_passwords = {
+        senha
+        for senha in queue_passwords
+        if senha in clinical_by_password
+        and len(clinical_by_password[senha]) == 1
+        and value_to_text(clinical_by_password[senha][0].values.get("evolucao")).strip()
+    }
+    finalized_passwords = {
+        senha
+        for senha in eligible_passwords
+        if value_to_text(
+            clinical_by_password[senha][0].values.get("Lançamento Salus - Status")
+        ).strip().upper() in finalized_statuses
+    }
+    processed = len(finalized_passwords)
+    missing_to_launch = len(eligible_passwords - finalized_passwords)
 
     return {
         "salus": len(queue_patients),
         "excel": sum(len(rows) for rows in clinical_by_password.values()),
         "encontrados": found,
         "faltam": missing_to_launch,
+        "processados": processed,
     }
 
 
-def refresh_cards() -> dict:
+def refresh_cards(update_status: bool = True) -> dict:
     cards = calculate_cards()
+    files = STATE["files"]
+    fila = Path(files["fila"])
+    clinica = Path(files["clinica"])
+    queue_by_password = {patient.senha: patient for patient in read_queue(fila)} if fila.exists() else {}
+    clinical_by_password, _, _ = read_clinical(clinica) if clinica.exists() else ({}, {}, [])
+    pending_rows = []
+    for senha, rows in clinical_by_password.items():
+        if len(rows) != 1:
+            continue
+        values = rows[0].values
+        status = value_to_text(values.get("Lançamento Salus - Status")).strip()
+        if status not in {"AGUARDANDO", "AGUARDANDO_CID", "ERRO"}:
+            continue
+        patient = queue_by_password.get(senha)
+        pending_rows.append({
+            "nome": (patient.nome if patient else rows[0].nome) or "-",
+            "senha": senha,
+            "iniciais": (patient.iniciais if patient else rows[0].iniciais) or "-",
+            "status": status,
+            "mensagem": value_to_text(values.get("Lançamento Salus - Mensagem")) or "Revisão necessária.",
+        })
     with LOCK:
         STATE["cards"] = cards
-        STATE["status"] = "Cards atualizados"
+        STATE["processed_now"] = cards.get("processados", 0)
+        STATE["pending_rows"] = pending_rows
+        if update_status:
+            STATE["status"] = "Cards atualizados"
     return cards
 
 
@@ -188,7 +265,11 @@ def run_new_day_worker() -> None:
         set_state(running=False)
 
 
-def run_etapa2_worker(only_password: str | None, batch_limit: int | None) -> None:
+def run_etapa2_worker(
+    only_password: str | None,
+    batch_limit: int | None,
+    retry_errors: bool = False,
+) -> None:
     try:
         files = STATE["files"].copy()
         fila = Path(files["fila"])
@@ -200,9 +281,21 @@ def run_etapa2_worker(only_password: str | None, batch_limit: int | None) -> Non
         clinical_by_password, field_meta, field_headers = read_clinical(clinica)
         successful_passwords = read_successful_passwords(relatorio)
         attempted_passwords: set[str] = set(successful_passwords)
+        error_passwords: set[str] = set()
         for senha, rows in clinical_by_password.items():
-            if any(value_to_text(row.values.get("Lançamento Salus - Status")) for row in rows):
+            statuses = {
+                value_to_text(row.values.get("Lançamento Salus - Status")).strip().upper()
+                for row in rows
+            }
+            if "ERRO" in statuses:
+                error_passwords.add(senha)
+            if any(statuses):
                 attempted_passwords.add(senha)
+
+        if retry_errors:
+            # Um erro anterior não significa lançamento concluído. Retira apenas
+            # esses registros da trava de duplicidade e mantém finalizados protegidos.
+            attempted_passwords.difference_update(error_passwords)
 
         # Somente pacientes com evolução textual, ainda não tentados, entram no lote.
         eligible_passwords = {
@@ -211,6 +304,7 @@ def run_etapa2_worker(only_password: str | None, batch_limit: int | None) -> Non
             if len(rows) == 1
             and value_to_text(rows[0].values.get("evolucao")).strip()
             and senha not in attempted_passwords
+            and (not retry_errors or senha in error_passwords)
         }
         queue_patients = [
             patient for patient in queue_patients
@@ -261,22 +355,28 @@ def run_etapa2_worker(only_password: str | None, batch_limit: int | None) -> Non
                         "situacao": "Em lançamento",
                     })
             elif event == "fim" and result:
+                # Ritmo operacional mínimo por paciente. Durante a espera o
+                # painel permanece como "Em lançamento" e mostra o cronômetro.
+                started = started_at.get(patient.senha, dt.datetime.now())
+                elapsed_before_finish = (dt.datetime.now() - started).total_seconds()
+                if elapsed_before_finish < 50:
+                    time.sleep(50 - elapsed_before_finish)
+                persist_patient_status(clinica, patient, result)
                 processed_count += 1
+                # Recalcula também a lista de pendentes imediatamente. Assim,
+                # um erro corrigido desaparece da tela sem refresh manual.
+                current_cards = refresh_cards(update_status=False)
                 elapsed = dt.datetime.now() - started_at.get(patient.senha, dt.datetime.now())
                 total_seconds = max(0, int(elapsed.total_seconds()))
                 elapsed_text = f"{total_seconds // 60}m {total_seconds % 60:02d}s" if total_seconds >= 60 else f"{total_seconds}s"
                 with LOCK:
-                    STATE["processed_now"] = processed_count
+                    STATE["cards"] = current_cards
+                    STATE["processed_now"] = current_cards.get("processados", 0)
                     for row in reversed(STATE["launch_rows"]):
                         if row["senha"] == patient.senha and row["situacao"] == "Em lançamento":
                             row["tempo"] = elapsed_text
                             row["situacao"] = "Concluído" if result.status not in {"ERRO", "PULADO"} else result.status
                             break
-                    if result.status not in {"JA_LANCADO", "PULADO"}:
-                        try:
-                            STATE["cards"]["faltam"] = max(0, int(STATE["cards"]["faltam"]) - 1)
-                        except (TypeError, ValueError):
-                            pass
                 log(f"{result.senha} - {result.nome} - {result.status}: {result.mensagem}")
 
         results = process_patients(
@@ -288,7 +388,9 @@ def run_etapa2_worker(only_password: str | None, batch_limit: int | None) -> Non
             dry_run=False,
             only_password=only_password,
             usar_defaults_obrigatorios=True,
-            stop_on_error=True,
+            # O lote nunca para por erro individual: registra ERRO no paciente
+            # e segue para o próximo. Finalizados continuam protegidos.
+            stop_on_error=False,
             progress_callback=progress,
         )
         write_report(results, relatorio)
@@ -326,7 +428,31 @@ HTML = r"""<!doctype html>
       background: var(--bg);
     }
     main { max-width: 1220px; margin: 0 auto; padding: 24px; }
+    .page-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
     h1 { margin: 0; font-size: 32px; letter-spacing: 0; }
+    .robot-stamp {
+      border: 3px solid #6b7280;
+      border-radius: 7px;
+      color: #6b7280;
+      background: #fff;
+      padding: 8px 15px;
+      font-size: 14px;
+      font-weight: 900;
+      letter-spacing: 1.4px;
+      text-transform: uppercase;
+      transform: rotate(-2deg);
+      box-shadow: inset 0 0 0 2px #fff, 0 2px 6px rgba(0,0,0,.08);
+    }
+    .robot-stamp.running {
+      color: #166534;
+      border-color: #16a34a;
+      background: #f0fdf4;
+      animation: stampPulse 1.15s ease-in-out infinite;
+    }
+    @keyframes stampPulse {
+      0%, 100% { opacity: 1; transform: rotate(-2deg) scale(1); }
+      50% { opacity: .68; transform: rotate(-2deg) scale(1.035); }
+    }
     .sub { color: var(--muted); margin: 6px 0 20px; }
     .panel {
       background: var(--panel);
@@ -397,6 +523,10 @@ HTML = r"""<!doctype html>
     .launch-status { color: #166534; font-weight: 800; }
     .launch-status.running { color: #1f4e78; }
     .launch-status.error { color: var(--danger); }
+    .pending-list { margin-bottom: 16px; }
+    .pending-row { display: grid; grid-template-columns: minmax(220px, 1fr) 110px 85px 150px minmax(260px, 2fr); gap: 10px; padding: 8px 4px; border-top: 1px solid var(--line); align-items: center; font-size: 13px; }
+    .pending-row:first-child { border-top: 0; }
+    .pending-status { color: #9a6700; font-weight: 800; }
     .status { color: var(--muted); margin-bottom: 8px; }
     pre {
       margin: 0;
@@ -419,7 +549,10 @@ HTML = r"""<!doctype html>
 </head>
 <body>
   <main>
-    <h1>Robo Sallus</h1>
+    <div class="page-head">
+      <h1>Robo Sallus</h1>
+      <div id="robot_stamp" class="robot-stamp">ROBÔ PARADO</div>
+    </div>
     <p class="sub">Novo dia arquiva o lote anterior e prepara as listas. Etapa 2 lança automaticamente as evoluções no Salus.</p>
 
     <section class="panel files">
@@ -459,6 +592,11 @@ HTML = r"""<!doctype html>
     <section class="current">
       <div class="launch-title">Pacientes em lançamento</div>
       <div id="launch_rows"><div class="launch-meta">Nenhum paciente em execução</div></div>
+    </section>
+
+    <section class="panel pending-list">
+      <div class="launch-title">Pendentes para finalizar</div>
+      <div id="pending_rows"><div class="launch-meta">Nenhum pendente registrado</div></div>
     </section>
 
     <div id="status" class="status">Pronto</div>
@@ -541,6 +679,9 @@ HTML = r"""<!doctype html>
       document.getElementById('encontrados').textContent = state.cards.encontrados;
       document.getElementById('faltam').textContent = state.cards.faltam;
       document.getElementById('processed').textContent = state.processed_now;
+      const robotStamp = document.getElementById('robot_stamp');
+      robotStamp.textContent = state.running ? 'ROBÔ EM EXECUÇÃO' : 'ROBÔ PARADO';
+      robotStamp.classList.toggle('running', state.running);
       const launchRows = document.getElementById('launch_rows');
       if (!state.launch_rows.length) {
         launchRows.innerHTML = '<div class="launch-meta">Nenhum paciente em execução</div>';
@@ -555,6 +696,14 @@ HTML = r"""<!doctype html>
           const statusClass = row.situacao === 'Em lançamento' ? 'running' : (row.situacao === 'Concluído' ? '' : 'error');
           return `<div class="launch-row"><div class="launch-name">${escapeHtml(row.nome)}</div><div class="launch-meta">Senha: ${escapeHtml(row.senha)}</div><div class="launch-meta">Iniciais: ${escapeHtml(row.iniciais)}</div><div class="launch-meta">${tempo}</div><div class="launch-status ${statusClass}">${row.situacao}</div></div>`;
         }).join('');
+      }
+      const pendingRows = document.getElementById('pending_rows');
+      if (!state.pending_rows.length) {
+        pendingRows.innerHTML = '<div class="launch-meta">Nenhum pendente registrado</div>';
+      } else {
+        pendingRows.innerHTML = state.pending_rows.map(row =>
+          `<div class="pending-row"><div class="launch-name">${escapeHtml(row.nome)}</div><div>Senha: ${escapeHtml(row.senha)}</div><div>${escapeHtml(row.iniciais)}</div><div class="pending-status">${escapeHtml(row.status)}</div><div>${escapeHtml(row.mensagem)}</div></div>`
+        ).join('');
       }
       document.getElementById('status').textContent = state.status;
       document.getElementById('logs').textContent = state.logs.join('\n');
@@ -666,6 +815,7 @@ class Handler(BaseHTTPRequestHandler):
                     args=(
                         data.get("only_password") or None,
                         int(data["batch_limit"]) if data.get("batch_limit") is not None else None,
+                        bool(data.get("retry_errors")),
                     ),
                     daemon=True,
                 ).start()
