@@ -1761,6 +1761,35 @@ def run_html_fill(
     if "enteral" in value_or("Exame Físico - Alimentação *", "Oral").lower():
         click_radio("100002", "physical-exam-enteral-detail", feeding_detail)
     click_radio("100002", "physical-exam-skin-lesion-yn", value("Exame Físico - Lesões na pele? *"))
+    if value("Exame Físico - Lesões na pele? *").lower().startswith("s"):
+        lesion_locations = value("Exame Físico - Localização da lesão * (cond.)")
+        other_locations = value("Exame Físico - Localização outras regiões * (cond.)")
+        for item in lesion_locations.split(";"):
+            item = item.strip()
+            if not item:
+                continue
+            # "Outras regiões" abre outro campo obrigatório. Sem o detalhe
+            # explícito, preserva as demais localizações informadas.
+            if "outras regi" in item.lower() and not other_locations:
+                continue
+            click_checkbox_label("100002", item)
+        for field in (
+            "Exame Físico - Detalhamento trocantérica * (cond.)",
+            "Exame Físico - Detalhamento calcâneo * (cond.)",
+            "Exame Físico - Localização outras regiões * (cond.)",
+            "Exame Físico - Características clínicas da lesão * (cond.)",
+        ):
+            for item in value(field).split(";"):
+                if item.strip():
+                    click_checkbox_label("100002", item.strip())
+        click_radio("100002", "dynamic-question-59", value("Exame Físico - Tipo de lesão identificada * (cond.)"))
+        click_radio("100002", "dynamic-question-60", value("Exame Físico - Condição atual da lesão * (cond.)"))
+        dressing_yn = value_or("Exame Físico - Houve curativo? * (cond.)", "Não")
+        click_radio("100002", "dynamic-question-63", dressing_yn)
+        if dressing_yn.lower().startswith("s"):
+            click_radio("100002", "dynamic-question-64", value("Exame Físico - Tipo de curativo * (cond.)"))
+            click_radio("100002", "dynamic-question-295", value("Exame Físico - Frequência de troca do curativo * (cond.)"))
+            click_radio("100002", "dynamic-question-65", value("Exame Físico - Frequência da troca do curativo está adequada? * (cond.)"))
     for item in value_or("Exame Físico - Controle de eliminação *", "Normal").split(";"):
         click_checkbox_label("100002", item.strip())
     next_sec("100002")
