@@ -110,6 +110,8 @@ def persist_patient_status(clinica: Path, patient: QueuePatient, result: Patient
         status = "FINALIZADO"
     elif result.status in {"AGUARDANDO", "AGUARDANDO_CID"}:
         status = result.status
+    elif result.status == "PRE_LANCADO":
+        status = "PRE_LANCADO"
     else:
         status = "ERRO"
     for row in range(2, ws.max_row + 1):
@@ -179,7 +181,7 @@ def refresh_cards(update_status: bool = True) -> dict:
             continue
         values = rows[0].values
         status = value_to_text(values.get("Lançamento Salus - Status")).strip()
-        if status not in {"AGUARDANDO", "AGUARDANDO_CID", "ERRO"}:
+        if status not in {"AGUARDANDO", "AGUARDANDO_CID", "ERRO", "PRE_LANCADO"}:
             continue
         patient = queue_by_password.get(senha)
         pending_rows.append({
@@ -196,6 +198,52 @@ def refresh_cards(update_status: bool = True) -> dict:
         if update_status:
             STATE["status"] = "Cards atualizados"
     return cards
+
+
+def calculate_daily_control() -> dict:
+    """Monta o painel diário sem alterar a planilha clínica."""
+    files = STATE["files"]
+    fila = Path(files["fila"])
+    clinica = Path(files["clinica"])
+    queue = read_queue(fila) if fila.exists() else []
+    clinical, _, _ = read_clinical(clinica) if clinica.exists() else ({}, {}, [])
+    queue_by_password = {patient.senha: patient for patient in queue}
+    passwords = list(queue_by_password)
+    passwords.extend(senha for senha in clinical if senha not in queue_by_password)
+    today_br = dt.date.today().strftime("%d/%m/%Y")
+    rows = []
+    counts = {"vermelho": 0, "amarelo": 0, "azul": 0, "verde": 0, "cinza": 0}
+    for senha in passwords:
+        base_rows = clinical.get(senha, [])
+        row = base_rows[0] if len(base_rows) == 1 else None
+        values = row.values if row else {}
+        patient = queue_by_password.get(senha)
+        evolution = value_to_text(values.get("evolucao")).strip()
+        evolution_date = value_to_text(values.get("Data da evolução")).strip()
+        responsible = value_to_text(values.get("Responsável pelo preenchimento")).strip()
+        launch_status = value_to_text(values.get("Lançamento Salus - Status")).strip().upper()
+        launch_date = value_to_text(values.get("Lançamento Salus - Data/hora")).strip()
+        if patient is None:
+            color, label = "cinza", "Não está mais internado"
+        elif launch_status in {"FINALIZADO", "SUCESSO", "SUCESSO_MANUAL", "SUCESSO_COM_ALERTA"} and launch_date.startswith(today_br):
+            color, label = "verde", "Confirmado hoje no Salus"
+        elif launch_status == "PRE_LANCADO":
+            color, label = "azul", "Pré-lançado"
+        elif evolution and evolution_date == today_br:
+            color, label = "amarelo", "Evolução de hoje aguardando revisão"
+        else:
+            color, label = "vermelho", "Evolução de hoje ausente"
+        counts[color] += 1
+        rows.append({
+            "nome": (patient.nome if patient else (row.nome if row else "")) or "-",
+            "senha": senha,
+            "iniciais": (patient.iniciais if patient else (row.iniciais if row else "")) or "-",
+            "data_evolucao": evolution_date or "Sem data",
+            "responsavel": responsible or "-",
+            "status": label,
+            "cor": color,
+        })
+    return {"data": today_br, "counts": counts, "rows": rows}
 
 
 def run_etapa1_worker() -> None:
@@ -228,7 +276,7 @@ def run_new_day_worker() -> None:
     try:
         date_label = dt.date.today().strftime("%d_%m_%Y")
         queue_output = EXPORTS / f"fila_salus_{date_label}.xlsx"
-        clinical_output = EXPORTS / f"data_base_lancamento_{date_label}.xlsx"
+        clinical_output = EXPORTS / f"data_base_lancar_{date_label}.xlsx"
         report_output = EXPORTS / f"relatorio_lancamentos_{date_label}.xlsx"
         cmd = [sys.executable, str(ROOT / "scripts" / "atualizar_novo_dia.py")]
 
@@ -269,6 +317,7 @@ def run_etapa2_worker(
     only_password: str | None,
     batch_limit: int | None,
     retry_errors: bool = False,
+    confirmar: bool = True,
 ) -> None:
     try:
         files = STATE["files"].copy()
@@ -375,7 +424,10 @@ def run_etapa2_worker(
                     for row in reversed(STATE["launch_rows"]):
                         if row["senha"] == patient.senha and row["situacao"] == "Em lançamento":
                             row["tempo"] = elapsed_text
-                            row["situacao"] = "Concluído" if result.status not in {"ERRO", "PULADO"} else result.status
+                            row["situacao"] = (
+                                "Pré-lançado" if result.status == "PRE_LANCADO"
+                                else ("Concluído" if result.status not in {"ERRO", "PULADO"} else result.status)
+                            )
                             break
                 log(f"{result.senha} - {result.nome} - {result.status}: {result.mensagem}")
 
@@ -391,6 +443,7 @@ def run_etapa2_worker(
             # O lote nunca para por erro individual: registra ERRO no paciente
             # e segue para o próximo. Finalizados continuam protegidos.
             stop_on_error=False,
+            confirmar=confirmar,
             progress_callback=progress,
         )
         write_report(results, relatorio)
@@ -454,6 +507,7 @@ HTML = r"""<!doctype html>
       50% { opacity: .68; transform: rotate(-2deg) scale(1.035); }
     }
     .sub { color: var(--muted); margin: 6px 0 20px; }
+    .nav-link { color: var(--blue); font-weight: 800; text-decoration: none; }
     .panel {
       background: var(--panel);
       border: 1px solid var(--line);
@@ -553,7 +607,7 @@ HTML = r"""<!doctype html>
       <h1>Robo Sallus</h1>
       <div id="robot_stamp" class="robot-stamp">ROBÔ PARADO</div>
     </div>
-    <p class="sub">Novo dia arquiva o lote anterior e prepara as listas. Etapa 2 lança automaticamente as evoluções no Salus.</p>
+    <p class="sub">Novo dia arquiva o lote anterior e prepara as listas. Etapa 2 lança automaticamente as evoluções no Salus. &nbsp; <a class="nav-link" href="/pre-lancamentos">Pré-lançamentos</a> &nbsp; <a class="nav-link" href="/controle-diario">Controle diário →</a></p>
 
     <section class="panel files">
       <label>Fila Salus</label>
@@ -595,8 +649,8 @@ HTML = r"""<!doctype html>
     </section>
 
     <section class="panel pending-list">
-      <div class="launch-title">Pendentes para finalizar</div>
-      <div id="pending_rows"><div class="launch-meta">Nenhum pendente registrado</div></div>
+      <div class="launch-title">Erros para revisar</div>
+      <div id="error_rows"><div class="launch-meta">Nenhum erro registrado</div></div>
     </section>
 
     <div id="status" class="status">Pronto</div>
@@ -697,14 +751,11 @@ HTML = r"""<!doctype html>
           return `<div class="launch-row"><div class="launch-name">${escapeHtml(row.nome)}</div><div class="launch-meta">Senha: ${escapeHtml(row.senha)}</div><div class="launch-meta">Iniciais: ${escapeHtml(row.iniciais)}</div><div class="launch-meta">${tempo}</div><div class="launch-status ${statusClass}">${row.situacao}</div></div>`;
         }).join('');
       }
-      const pendingRows = document.getElementById('pending_rows');
-      if (!state.pending_rows.length) {
-        pendingRows.innerHTML = '<div class="launch-meta">Nenhum pendente registrado</div>';
-      } else {
-        pendingRows.innerHTML = state.pending_rows.map(row =>
-          `<div class="pending-row"><div class="launch-name">${escapeHtml(row.nome)}</div><div>Senha: ${escapeHtml(row.senha)}</div><div>${escapeHtml(row.iniciais)}</div><div class="pending-status">${escapeHtml(row.status)}</div><div>${escapeHtml(row.mensagem)}</div></div>`
-        ).join('');
-      }
+      const errors = state.pending_rows.filter(row => row.status === 'ERRO');
+      const errorRows = document.getElementById('error_rows');
+      errorRows.innerHTML = errors.length ? errors.map(row =>
+        `<div class="pending-row"><div class="launch-name">${escapeHtml(row.nome)}</div><div>Senha: ${escapeHtml(row.senha)}</div><div>${escapeHtml(row.iniciais)}</div><div class="launch-status error">ERRO</div><div>${escapeHtml(row.mensagem)}</div></div>`
+      ).join('') : '<div class="launch-meta">Nenhum erro registrado</div>';
       document.getElementById('status').textContent = state.status;
       document.getElementById('logs').textContent = state.logs.join('\n');
       document.getElementById('novoDia').disabled = state.running;
@@ -723,6 +774,87 @@ HTML = r"""<!doctype html>
 </body>
 </html>
 """
+
+PRE_HTML = r"""<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pré-lançamentos - Robo Sallus</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:#1f2937; background:#f4f6f8; }
+    main { max-width:1220px; margin:0 auto; padding:24px; }
+    .head { display:flex; justify-content:space-between; align-items:center; gap:16px; margin-bottom:20px; }
+    h1 { margin:0; font-size:30px; }
+    a { color:#1f4e78; font-weight:800; text-decoration:none; }
+    .summary { display:flex; gap:12px; margin-bottom:16px; }
+    .actions { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:16px; background:#fff; border:1px solid #d8dee6; border-radius:8px; padding:14px; }
+    button { border:0; border-radius:6px; padding:11px 16px; color:#fff; background:#1f4e78; font-weight:800; cursor:pointer; }
+    button:disabled { opacity:.55; cursor:wait; }
+    input,select { height:39px; border:1px solid #d8dee6; border-radius:6px; padding:0 10px; background:#fff; }
+    .count { background:#fff; border:1px solid #d8dee6; border-radius:8px; padding:12px 16px; font-weight:800; }
+    .panel { background:#fff; border:1px solid #d8dee6; border-radius:8px; padding:16px; margin-bottom:16px; }
+    h2 { margin:0 0 10px; font-size:19px; }
+    .row { display:grid; grid-template-columns:minmax(230px,1fr) 120px 100px 170px minmax(280px,2fr); gap:10px; padding:10px 4px; border-top:1px solid #e5e7eb; align-items:center; font-size:13px; }
+    .row:first-child { border-top:0; }
+    .name { font-weight:800; color:#17324d; }
+    .status { font-weight:900; color:#9a6700; }
+    .error .status { color:#9b1c1c; }
+    .empty { color:#667085; padding:8px 0; }
+    @media(max-width:800px){ .row{grid-template-columns:1fr 1fr}.summary{flex-wrap:wrap} }
+  </style>
+</head>
+<body><main>
+  <div class="head"><h1>Pré-lançamentos e erros</h1><div><a href="/">← Lançamentos</a> &nbsp; <a href="/controle-diario">Controle diário →</a></div></div>
+  <div class="actions">
+    <button id="preButton" onclick="startPreLaunch()">Iniciar pré-lançamento</button>
+    <label>Somente senha</label><input id="preSenha" type="text" style="width:145px">
+    <label>Lote</label><select id="preLimit"><option value="3">3 pacientes</option><option value="10">10 pacientes</option><option value="20">20 pacientes</option><option value="all">Todos</option></select>
+  </div>
+  <div class="summary"><div class="count">Aguardando finalização: <span id="waiting_count">0</span></div><div class="count">Com erro: <span id="error_count">0</span></div></div>
+  <section class="panel"><h2>Aguardando finalização</h2><div id="waiting"></div></section>
+  <section class="panel"><h2>Erros para revisar</h2><div id="errors"></div></section>
+</main><script>
+  const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
+  const render = (rows, css='') => rows.length ? rows.map(row => `<div class="row ${css}"><div class="name">${esc(row.nome)}</div><div>Senha: ${esc(row.senha)}</div><div>${esc(row.iniciais)}</div><div class="status">${esc(row.status)}</div><div>${esc(row.mensagem)}</div></div>`).join('') : '<div class="empty">Nenhum registro.</div>';
+  async function poll(){
+    const state = await fetch('/api/status').then(r => r.json());
+    const waiting = state.pending_rows.filter(r => r.status !== 'ERRO');
+    const errors = state.pending_rows.filter(r => r.status === 'ERRO');
+    document.getElementById('waiting_count').textContent = waiting.length;
+    document.getElementById('error_count').textContent = errors.length;
+    document.getElementById('waiting').innerHTML = render(waiting);
+    document.getElementById('errors').innerHTML = render(errors,'error');
+    document.getElementById('preButton').disabled = state.running;
+  }
+  async function startPreLaunch(){
+    const senha=document.getElementById('preSenha').value.trim();
+    const raw=document.getElementById('preLimit').value;
+    const limit=raw==='all'?null:Number(raw);
+    if(!confirm('Preencher e validar sem confirmar a evolução no Salus?')) return;
+    const response=await fetch('/api/etapa2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({only_password:senha,batch_limit:limit,confirmar:false})});
+    if(!response.ok) alert(await response.text());
+    await poll();
+  }
+  setInterval(poll,1200); poll();
+</script></body></html>"""
+
+CONTROL_HTML = r"""<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Controle diário - Robo Sallus</title><style>
+*{box-sizing:border-box}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#1f2937;background:#f4f6f8}main{max-width:1320px;margin:0 auto;padding:24px}.head{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:18px}h1{margin:0;font-size:30px}a{color:#1f4e78;font-weight:800;text-decoration:none}.cards{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:16px}.card{background:#fff;border:1px solid #d8dee6;border-radius:8px;padding:12px}.card b{font-size:26px;display:block;margin-top:4px}.filters{display:flex;gap:10px;flex-wrap:wrap;background:#fff;border:1px solid #d8dee6;border-radius:8px;padding:12px;margin-bottom:12px}input,select{height:38px;border:1px solid #d8dee6;border-radius:6px;padding:0 10px;background:#fff}.table{background:#fff;border:1px solid #d8dee6;border-radius:8px;overflow:hidden}.row{display:grid;grid-template-columns:minmax(230px,1.4fr) 110px 90px 130px 150px minmax(230px,1.4fr);gap:10px;align-items:center;padding:10px 12px;border-top:1px solid #e5e7eb;font-size:13px}.row:first-child{border-top:0}.header{font-weight:800;background:#eef2f6}.name{font-weight:800}.row.vermelho{border-left:7px solid #dc2626;background:#fef2f2}.row.amarelo{border-left:7px solid #d97706;background:#fffbeb}.row.azul{border-left:7px solid #2563eb;background:#eff6ff}.row.verde{border-left:7px solid #16a34a;background:#f0fdf4}.row.cinza{border-left:7px solid #6b7280;background:#f3f4f6;color:#6b7280}.legend{font-size:13px;color:#667085;margin:0 0 12px}@media(max-width:850px){.cards{grid-template-columns:repeat(2,1fr)}.row{grid-template-columns:1fr 1fr}}
+</style></head><body><main>
+<div class="head"><h1>Controle diário <span id="date"></span></h1><div><a href="/">← Lançamentos</a> &nbsp; <a href="/pre-lancamentos">Pré-lançamentos →</a></div></div>
+<p class="legend">Vermelho: evolução de hoje ausente · Amarelo: aguardando revisão · Azul: pré-lançado · Verde: confirmado hoje · Cinza: fora da fila atual.</p>
+<div class="cards"><div class="card">Sem evolução hoje<b id="c_vermelho">0</b></div><div class="card">Aguardando revisão<b id="c_amarelo">0</b></div><div class="card">Pré-lançados<b id="c_azul">0</b></div><div class="card">Confirmados hoje<b id="c_verde">0</b></div><div class="card">Fora da fila<b id="c_cinza">0</b></div></div>
+<div class="filters"><input id="search" placeholder="Buscar nome ou senha" oninput="render()"><select id="filter" onchange="render()"><option value="">Todos os status</option><option value="vermelho">Vermelho</option><option value="amarelo">Amarelo</option><option value="azul">Azul</option><option value="verde">Verde</option><option value="cinza">Cinza</option></select></div>
+<div class="table"><div class="row header"><div>Paciente</div><div>Senha</div><div>Iniciais</div><div>Data evolução</div><div>Responsável</div><div>Status</div></div><div id="rows"></div></div>
+</main><script>
+let data={rows:[],counts:{}};const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
+function render(){const q=document.getElementById('search').value.toLowerCase();const f=document.getElementById('filter').value;const rows=data.rows.filter(r=>(!f||r.cor===f)&&(!q||(r.nome+' '+r.senha).toLowerCase().includes(q)));document.getElementById('rows').innerHTML=rows.length?rows.map(r=>`<div class="row ${r.cor}"><div class="name">${esc(r.nome)}</div><div>${esc(r.senha)}</div><div>${esc(r.iniciais)}</div><div>${esc(r.data_evolucao)}</div><div>${esc(r.responsavel)}</div><div>${esc(r.status)}</div></div>`).join(''):'<div style="padding:18px;color:#667085">Nenhum paciente neste filtro.</div>'}
+async function poll(){data=await fetch('/api/controle-diario').then(r=>r.json());document.getElementById('date').textContent='- '+data.data;for(const c of ['vermelho','amarelo','azul','verde','cinza'])document.getElementById('c_'+c).textContent=data.counts[c]||0;render()}setInterval(poll,2500);poll();
+</script></body></html>"""
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -749,6 +881,25 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+        if path == "/pre-lancamentos":
+            body = PRE_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path == "/controle-diario":
+            body = CONTROL_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path == "/api/controle-diario":
+            self._send_json(calculate_daily_control())
             return
         if path == "/api/status":
             with LOCK:
@@ -816,6 +967,7 @@ class Handler(BaseHTTPRequestHandler):
                         data.get("only_password") or None,
                         int(data["batch_limit"]) if data.get("batch_limit") is not None else None,
                         bool(data.get("retry_errors")),
+                        data.get("confirmar", True) is not False,
                     ),
                     daemon=True,
                 ).start()

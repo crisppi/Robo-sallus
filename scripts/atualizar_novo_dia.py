@@ -14,6 +14,7 @@ from copy import copy
 from pathlib import Path
 
 from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
 
 from gerar_lista_pacientes import fetch_patients, pick, save_excel
 
@@ -45,16 +46,48 @@ def archive_active_exports() -> list[Path]:
     return moved
 
 
-def generate_clinical_base(patients: list[dict], template: Path, output: Path) -> None:
-    if not template.exists():
+def generate_clinical_base(
+    patients: list[dict],
+    template: Path,
+    output: Path,
+    previous_workbook=None,
+) -> None:
+    if previous_workbook is None and not template.exists():
         raise FileNotFoundError(f"Modelo da base clinica nao encontrado: {template}")
 
-    workbook = load_workbook(template)
+    workbook = previous_workbook or load_workbook(template)
     if "Preenchimento" not in workbook.sheetnames:
         raise RuntimeError("O modelo precisa conter a aba 'Preenchimento'.")
     sheet = workbook["Preenchimento"]
     if sheet.max_row < 2:
         raise RuntimeError("O modelo precisa conter uma linha formatada abaixo do cabecalho.")
+
+    headers = {str(cell.value): cell.column for cell in sheet[1] if cell.value}
+    if "evolucao" not in headers:
+        # Modelos antigos não possuíam esta coluna. Acrescentar no fim evita
+        # deslocar listas/validações existentes.
+        evolution_column = sheet.max_column + 1
+        sheet.cell(1, evolution_column).value = "evolucao"
+        reference = sheet.cell(1, max(1, evolution_column - 1))
+        target = sheet.cell(1, evolution_column)
+        target.font = copy(reference.font)
+        target.fill = copy(reference.fill)
+        target.border = copy(reference.border)
+        target.alignment = copy(reference.alignment)
+        headers["evolucao"] = evolution_column
+
+    previous_rows: dict[tuple[str, str], dict[str, object]] = {}
+    senha_col = headers.get("Senha")
+    id_col = headers.get("ID internação")
+    if senha_col and id_col:
+        for row_number in range(2, sheet.max_row + 1):
+            senha = str(sheet.cell(row_number, senha_col).value or "").strip()
+            admission_id = str(sheet.cell(row_number, id_col).value or "").strip()
+            if senha:
+                previous_rows[(senha, admission_id)] = {
+                    header: sheet.cell(row_number, column).value
+                    for header, column in headers.items()
+                }
 
     row_style = [
         (
@@ -93,7 +126,33 @@ def generate_clinical_base(patients: list[dict], template: Path, output: Path) -
         for column, value in enumerate(values, 1):
             sheet.cell(row_number, column).value = value
 
-    sheet.auto_filter.ref = f"A1:FI{len(patients) + 1}"
+        senha = str(values[2] or "").strip()
+        admission_id = str(values[4] or "").strip()
+        previous = previous_rows.get((senha, admission_id), {})
+        # Dados estáveis da mesma internação podem ser reaproveitados. Os
+        # blocos de exame, conduta, UTI, auditor e status são sempre diários.
+        reusable_headers = {
+            "Dados da Internação - Caráter da internação *",
+            "Dados da Internação - Tipo da internação *",
+            "Dados da Internação - Data da internação *",
+            "Dados da Internação - Acomodação *",
+            "Dados da Internação - Paciente em isolamento? *",
+            "Dados da Internação - Motivo do isolamento * (cond.)",
+            "Dados da Internação - CID de internação *",
+            "Dados da Internação - CID ajustado *",
+            "Dados da Internação - Comorbidades *",
+        }
+        for header in reusable_headers:
+            column = headers.get(header)
+            value = previous.get(header)
+            if column and value not in (None, ""):
+                sheet.cell(row_number, column).value = value
+
+        evolution_cell = sheet.cell(row_number, headers["evolucao"])
+        evolution_cell.value = None
+        evolution_cell.fill = PatternFill("solid", fgColor="FFC7CE")
+
+    sheet.auto_filter.ref = f"A1:{sheet.cell(1, sheet.max_column).column_letter}{len(patients) + 1}"
     output.parent.mkdir(parents=True, exist_ok=True)
     workbook.save(output)
 
@@ -118,7 +177,7 @@ def main() -> int:
 
     date_label = args.data.strftime("%d_%m_%Y")
     queue_output = EXPORTS / f"fila_salus_{date_label}.xlsx"
-    clinical_output = EXPORTS / f"data_base_lancamento_{date_label}.xlsx"
+    clinical_output = EXPORTS / f"data_base_lancar_{date_label}.xlsx"
 
     # Baixa primeiro: se a sessao do Salus estiver indisponivel, nenhum arquivo
     # existente sera movido.
@@ -132,9 +191,27 @@ def main() -> int:
     if not patients:
         raise RuntimeError("O Salus retornou uma fila vazia; a virada foi cancelada.")
 
+    active_bases = sorted(
+        [
+            path
+            for path in (
+                list(EXPORTS.glob("data_base_lancar*.xlsx"))
+                + list(EXPORTS.glob("data_base_lancamento*.xlsx"))
+            )
+            if "antes_" not in path.name.lower()
+        ],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    previous_workbook = load_workbook(active_bases[0]) if active_bases else None
     moved = [] if args.nao_arquivar else archive_active_exports()
     save_excel(patients, queue_output)
-    generate_clinical_base(patients, args.modelo, clinical_output)
+    generate_clinical_base(
+        patients,
+        args.modelo,
+        clinical_output,
+        previous_workbook=previous_workbook,
+    )
 
     print(f"Arquivos arquivados: {len(moved)}")
     print(f"Fila gerada: {queue_output}")

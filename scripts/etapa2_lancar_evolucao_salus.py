@@ -594,15 +594,16 @@ class SalusExecutor:
     clicando e digitando nos campos como um usuario.
     """
 
-    def __init__(self, usar_defaults_obrigatorios: bool = False) -> None:
+    def __init__(self, usar_defaults_obrigatorios: bool = False, confirmar: bool = True) -> None:
         self.usar_defaults_obrigatorios = usar_defaults_obrigatorios
+        self.confirmar = confirmar
 
     def lancar(self, queue_patient: QueuePatient, clinical_patient: ClinicalPatient, fields: list[PreparedField]) -> list[PreparedField]:
         from lancar_evolucao_html_salus import run_html_fill
 
         result = run_html_fill(
             clinical_patient,
-            confirmar=True,
+            confirmar=self.confirmar,
             usar_defaults_obrigatorios=self.usar_defaults_obrigatorios,
         )
         if result.get("missingCid"):
@@ -675,9 +676,13 @@ def process_patients(
     limit: int | None = None,
     usar_defaults_obrigatorios: bool = False,
     stop_on_error: bool = False,
+    confirmar: bool = True,
     progress_callback: Callable[[str, QueuePatient, PatientResult | None], None] | None = None,
 ) -> list[PatientResult]:
-    executor = DryRunExecutor() if dry_run else SalusExecutor(usar_defaults_obrigatorios=usar_defaults_obrigatorios)
+    executor = DryRunExecutor() if dry_run else SalusExecutor(
+        usar_defaults_obrigatorios=usar_defaults_obrigatorios,
+        confirmar=confirmar,
+    )
     results: list[PatientResult] = []
     processed = 0
 
@@ -794,6 +799,9 @@ def process_patients(
             alerts,
             dry_run=dry_run,
         )
+        if not dry_run and not confirmar and result.status in {"SUCESSO", "SUCESSO_COM_ALERTA"}:
+            result.status = "PRE_LANCADO"
+            result.mensagem = "Pré-lançamento preenchido e validado; aguardando confirmação."
         results.append(result)
         if progress_callback:
             progress_callback("fim", queue_patient, result)
