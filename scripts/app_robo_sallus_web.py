@@ -848,12 +848,6 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> int:
     EXPORTS.mkdir(parents=True, exist_ok=True)
     try:
-        started = start_salus_chrome()
-        if started:
-            log("Chrome do Salus aberto. Faca login nele antes de iniciar o Novo dia.")
-    except SalusCdpError as exc:
-        log(f"ATENCAO: {exc}")
-    try:
         refresh_cards()
     except Exception as exc:
         log(f"Aviso ao carregar cards: {exc}")
@@ -863,6 +857,16 @@ def main() -> int:
     print(f"Robo Sallus aberto em {url}")
     print("Mantenha esta janela aberta enquanto usa a tela.")
     webbrowser.open(url)
+
+    def open_salus_after_interface() -> None:
+        try:
+            time.sleep(1.0)
+            start_salus_chrome()
+            log("Portal Salus aberto no Chrome do robo.")
+        except SalusCdpError as exc:
+            log(f"ATENCAO: {exc}")
+
+    threading.Thread(target=open_salus_after_interface, daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

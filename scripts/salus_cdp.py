@@ -52,13 +52,7 @@ def _get_json(url: str) -> Any:
 
 
 def start_salus_chrome(cdp_url: str = DEFAULT_CDP, wait_seconds: float = 12.0) -> bool:
-    """Garante um Chrome separado, com DevTools remoto, pronto para o Salus."""
-    try:
-        _get_json(f"{cdp_url.rstrip('/')}/json/version")
-        return False
-    except SalusCdpError:
-        pass
-
+    """Garante o Chrome remoto e sempre abre o portal do Salus nele."""
     if sys.platform != "darwin":
         raise SalusCdpError(
             "Inicializacao automatica disponivel no macOS. Abra o Chrome com "
@@ -75,6 +69,16 @@ def start_salus_chrome(cdp_url: str = DEFAULT_CDP, wait_seconds: float = 12.0) -
 
     profile = Path.home() / ".robo-sallus" / "chrome-profile"
     profile.mkdir(parents=True, exist_ok=True)
+
+    try:
+        _get_json(f"{cdp_url.rstrip('/')}/json/version")
+        already_running = True
+    except SalusCdpError:
+        already_running = False
+
+    # Executar novamente o mesmo binario/perfil encaminha a URL para a
+    # instancia existente. Assim o Salus abre em todo inicio, mesmo quando a
+    # porta 9222 ja estava ativa.
     with open(os.devnull, "wb") as devnull:
         subprocess.Popen(
             [
@@ -87,6 +91,9 @@ def start_salus_chrome(cdp_url: str = DEFAULT_CDP, wait_seconds: float = 12.0) -
             stderr=devnull,
             start_new_session=True,
         )
+
+    if already_running:
+        return False
 
     deadline = time.time() + wait_seconds
     while time.time() < deadline:
