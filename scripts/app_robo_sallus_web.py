@@ -32,7 +32,7 @@ from etapa2_lancar_evolucao_salus import (
     value_to_text,
     write_report,
 )
-from salus_cdp import navigate_salus
+from salus_cdp import SalusCdpError, navigate_salus, start_salus_chrome
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -286,8 +286,8 @@ def run_new_day_worker() -> None:
             for line in completed.stdout.strip().splitlines():
                 log(line)
         if completed.stderr.strip():
-            for line in completed.stderr.strip().splitlines():
-                log(line)
+            lines = [line.strip() for line in completed.stderr.splitlines() if line.strip()]
+            log(lines[-1] if lines else "Erro ao preparar o novo dia.")
         if completed.returncode != 0:
             set_state(status=f"Novo dia falhou com codigo {completed.returncode}")
             log("ERRO: nenhum arquivo foi substituido se a fila nao foi baixada.")
@@ -1009,6 +1009,16 @@ def main() -> int:
     print(f"Robo Sallus aberto em {url}")
     print("Mantenha esta janela aberta enquanto usa a tela.")
     webbrowser.open(url)
+
+    def open_salus_after_interface() -> None:
+        try:
+            time.sleep(1.0)
+            start_salus_chrome()
+            log("Portal Salus aberto no Chrome do robo.")
+        except SalusCdpError as exc:
+            log(f"ATENCAO: {exc}")
+
+    threading.Thread(target=open_salus_after_interface, daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

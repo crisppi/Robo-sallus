@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import shutil
+import sys
 from copy import copy
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 
 from gerar_lista_pacientes import fetch_patients, pick, save_excel
+from salus_cdp import SalusCdpError
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -221,4 +223,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except SalusCdpError as exc:
+        print(f"Erro: {exc}", file=sys.stderr)
+        raise SystemExit(1)

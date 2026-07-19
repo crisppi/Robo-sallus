@@ -11,10 +11,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import websocket
@@ -22,6 +27,7 @@ import websocket
 
 DEFAULT_CDP = "http://127.0.0.1:9222"
 SALUS_ORIGIN = "https://salus.orizon.com.br"
+SALUS_START = "https://salus.orizon.com.br/salus/gestao-internacao"
 
 
 class SalusCdpError(RuntimeError):
@@ -36,8 +42,85 @@ class BrowserTab:
 
 
 def _get_json(url: str) -> Any:
-    with urllib.request.urlopen(url, timeout=10) as response:
-        return json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(url, timeout=10) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+        raise SalusCdpError(
+            "O Chrome do Salus nao esta disponivel. Feche-o e abra novamente "
+            "pelo RoboSallus.command; depois faca login no Salus."
+        ) from exc
+
+
+def _open_cdp_tab(url: str, cdp_url: str = DEFAULT_CDP) -> None:
+    endpoint = f"{cdp_url.rstrip('/')}/json/new?{urllib.parse.quote(url, safe=':/')}"
+    try:
+        request = urllib.request.Request(endpoint, method="PUT")
+        with urllib.request.urlopen(request, timeout=10) as response:
+            json.loads(response.read().decode("utf-8"))
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+        raise SalusCdpError("Nao foi possivel abrir a aba do Salus no Chrome do robo.") from exc
+
+
+def start_salus_chrome(cdp_url: str = DEFAULT_CDP, wait_seconds: float = 12.0) -> bool:
+    """Garante o Chrome remoto e sempre abre o portal do Salus nele."""
+    if sys.platform != "darwin":
+        raise SalusCdpError(
+            "Inicializacao automatica disponivel no macOS. Abra o Chrome com "
+            "--remote-debugging-port=9222 e acesse o Salus."
+        )
+
+    candidates = (
+        Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+        Path.home() / "Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    )
+    chrome = next((path for path in candidates if path.exists()), None)
+    if chrome is None:
+        raise SalusCdpError("Google Chrome nao encontrado. Instale o Chrome e abra o Robo novamente.")
+
+    profile = Path.home() / ".robo-sallus" / "chrome-profile"
+    profile.mkdir(parents=True, exist_ok=True)
+
+    try:
+        _get_json(f"{cdp_url.rstrip('/')}/json/version")
+        already_running = True
+    except SalusCdpError:
+        already_running = False
+
+    if already_running:
+        _open_cdp_tab(SALUS_START, cdp_url)
+        return False
+
+    # Executar novamente o mesmo binario/perfil encaminha a URL para a
+    # instancia existente. Assim o Salus abre em todo inicio, mesmo quando a
+    # porta 9222 ja estava ativa.
+    with open(os.devnull, "wb") as devnull:
+        subprocess.Popen(
+            [
+                "/usr/bin/open",
+                "-na",
+                "Google Chrome",
+                "--args",
+                "--remote-debugging-port=9222",
+                f"--user-data-dir={profile}",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "about:blank",
+            ],
+            stdout=devnull,
+            stderr=devnull,
+            start_new_session=True,
+        )
+
+    deadline = time.time() + wait_seconds
+    while time.time() < deadline:
+        try:
+            _get_json(f"{cdp_url.rstrip('/')}/json/version")
+            _open_cdp_tab(SALUS_START, cdp_url)
+            return True
+        except SalusCdpError:
+            time.sleep(0.4)
+    raise SalusCdpError("O Chrome foi aberto, mas a conexao com ele nao ficou pronta.")
 
 
 def find_salus_tab(cdp_url: str = DEFAULT_CDP, url_contains: str | None = None) -> BrowserTab:
