@@ -27,7 +27,7 @@ import websocket
 
 DEFAULT_CDP = "http://127.0.0.1:9222"
 SALUS_ORIGIN = "https://salus.orizon.com.br"
-SALUS_LOGIN = "https://www.orizonbrasil.com.br/acesso-restrito.html"
+SALUS_START = "https://salus.orizon.com.br/salus/gestao-internacao"
 
 
 class SalusCdpError(RuntimeError):
@@ -88,7 +88,7 @@ def start_salus_chrome(cdp_url: str = DEFAULT_CDP, wait_seconds: float = 12.0) -
         already_running = False
 
     if already_running:
-        _open_cdp_tab(SALUS_LOGIN, cdp_url)
+        _open_cdp_tab(SALUS_START, cdp_url)
         return False
 
     # Executar novamente o mesmo binario/perfil encaminha a URL para a
@@ -116,7 +116,7 @@ def start_salus_chrome(cdp_url: str = DEFAULT_CDP, wait_seconds: float = 12.0) -
     while time.time() < deadline:
         try:
             _get_json(f"{cdp_url.rstrip('/')}/json/version")
-            _open_cdp_tab(SALUS_LOGIN, cdp_url)
+            _open_cdp_tab(SALUS_START, cdp_url)
             return True
         except SalusCdpError:
             time.sleep(0.4)
