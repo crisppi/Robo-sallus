@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,6 +52,16 @@ def _get_json(url: str) -> Any:
         ) from exc
 
 
+def _open_cdp_tab(url: str, cdp_url: str = DEFAULT_CDP) -> None:
+    endpoint = f"{cdp_url.rstrip('/')}/json/new?{urllib.parse.quote(url, safe=':/')}"
+    try:
+        request = urllib.request.Request(endpoint, method="PUT")
+        with urllib.request.urlopen(request, timeout=10) as response:
+            json.loads(response.read().decode("utf-8"))
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+        raise SalusCdpError("Nao foi possivel abrir a aba do Salus no Chrome do robo.") from exc
+
+
 def start_salus_chrome(cdp_url: str = DEFAULT_CDP, wait_seconds: float = 12.0) -> bool:
     """Garante o Chrome remoto e sempre abre o portal do Salus nele."""
     if sys.platform != "darwin":
@@ -76,29 +87,36 @@ def start_salus_chrome(cdp_url: str = DEFAULT_CDP, wait_seconds: float = 12.0) -
     except SalusCdpError:
         already_running = False
 
+    if already_running:
+        _open_cdp_tab(SALUS_LOGIN, cdp_url)
+        return False
+
     # Executar novamente o mesmo binario/perfil encaminha a URL para a
     # instancia existente. Assim o Salus abre em todo inicio, mesmo quando a
     # porta 9222 ja estava ativa.
     with open(os.devnull, "wb") as devnull:
         subprocess.Popen(
             [
-                str(chrome),
+                "/usr/bin/open",
+                "-na",
+                "Google Chrome",
+                "--args",
                 "--remote-debugging-port=9222",
                 f"--user-data-dir={profile}",
-                SALUS_LOGIN,
+                "--no-first-run",
+                "--no-default-browser-check",
+                "about:blank",
             ],
             stdout=devnull,
             stderr=devnull,
             start_new_session=True,
         )
 
-    if already_running:
-        return False
-
     deadline = time.time() + wait_seconds
     while time.time() < deadline:
         try:
             _get_json(f"{cdp_url.rstrip('/')}/json/version")
+            _open_cdp_tab(SALUS_LOGIN, cdp_url)
             return True
         except SalusCdpError:
             time.sleep(0.4)
