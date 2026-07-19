@@ -66,6 +66,10 @@ Ou, no macOS, abrir o arquivo:
 ./RoboSallus.command
 ```
 
+No primeiro uso, `RoboSallus.command` cria um ambiente local, instala as
+dependencias e abre uma janela separada do Chrome preparada para o Salus.
+Faca o login nessa janela; o perfil fica preservado para os proximos usos.
+
 ## Observacoes
 
 Credenciais nao devem ser salvas em texto puro neste repositorio. Para continuar, informe a senha em tempo de execucao ou use uma variavel de ambiente/local seguro.

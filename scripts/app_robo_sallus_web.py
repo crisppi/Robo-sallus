@@ -32,7 +32,7 @@ from etapa2_lancar_evolucao_salus import (
     value_to_text,
     write_report,
 )
-from salus_cdp import navigate_salus
+from salus_cdp import SalusCdpError, navigate_salus, start_salus_chrome
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -238,8 +238,8 @@ def run_new_day_worker() -> None:
             for line in completed.stdout.strip().splitlines():
                 log(line)
         if completed.stderr.strip():
-            for line in completed.stderr.strip().splitlines():
-                log(line)
+            lines = [line.strip() for line in completed.stderr.splitlines() if line.strip()]
+            log(lines[-1] if lines else "Erro ao preparar o novo dia.")
         if completed.returncode != 0:
             set_state(status=f"Novo dia falhou com codigo {completed.returncode}")
             log("ERRO: nenhum arquivo foi substituido se a fila nao foi baixada.")
@@ -847,6 +847,12 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> int:
     EXPORTS.mkdir(parents=True, exist_ok=True)
+    try:
+        started = start_salus_chrome()
+        if started:
+            log("Chrome do Salus aberto. Faca login nele antes de iniciar o Novo dia.")
+    except SalusCdpError as exc:
+        log(f"ATENCAO: {exc}")
     try:
         refresh_cards()
     except Exception as exc:
