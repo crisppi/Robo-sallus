@@ -118,7 +118,9 @@ def main() -> int:
     parser.add_argument("--user-key", type=int, default=49)
     parser.add_argument("--prestador", type=int, default=113)
     parser.add_argument("--empresa-auditoria", type=int, default=6)
-    parser.add_argument("--tamanho-pagina", type=int, default=500)
+    # A ordenação retornada pelo Salus muda com lotes muito grandes. Usar a
+    # mesma paginação padrão da tela mantém a planilha na ordem visual.
+    parser.add_argument("--tamanho-pagina", type=int, default=10)
     parser.add_argument("--cdp-url", default="http://127.0.0.1:9222")
     parser.add_argument("--saida", default=f"exports/pacientes_sirio_libanes_{today}.xlsx")
     args = parser.parse_args()

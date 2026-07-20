@@ -176,14 +176,27 @@ def refresh_cards(update_status: bool = True) -> dict:
     queue_by_password = {patient.senha: patient for patient in read_queue(fila)} if fila.exists() else {}
     clinical_by_password, _, _ = read_clinical(clinica) if clinica.exists() else ({}, {}, [])
     pending_rows = []
+    finalized_rows = []
+    finalized_statuses = {
+        "FINALIZADO", "SUCESSO", "SUCESSO_COM_ALERTA", "SUCESSO_MANUAL", "JA_LANCADO"
+    }
     for senha, rows in clinical_by_password.items():
         if len(rows) != 1:
             continue
         values = rows[0].values
-        status = value_to_text(values.get("Lançamento Salus - Status")).strip()
+        status = value_to_text(values.get("Lançamento Salus - Status")).strip().upper()
+        patient = queue_by_password.get(senha)
+        if status in finalized_statuses:
+            finalized_rows.append({
+                "nome": (patient.nome if patient else rows[0].nome) or "-",
+                "senha": senha,
+                "iniciais": (patient.iniciais if patient else rows[0].iniciais) or "-",
+                "tempo": value_to_text(values.get("Lançamento Salus - Data/hora")) or "Manual",
+                "situacao": "Concluído",
+            })
+            continue
         if status not in {"AGUARDANDO", "AGUARDANDO_CID", "ERRO", "PRE_LANCADO"}:
             continue
-        patient = queue_by_password.get(senha)
         pending_rows.append({
             "nome": (patient.nome if patient else rows[0].nome) or "-",
             "senha": senha,
@@ -195,6 +208,8 @@ def refresh_cards(update_status: bool = True) -> dict:
         STATE["cards"] = cards
         STATE["processed_now"] = cards.get("processados", 0)
         STATE["pending_rows"] = pending_rows
+        if not STATE["running"]:
+            STATE["launch_rows"] = finalized_rows
         if update_status:
             STATE["status"] = "Cards atualizados"
     return cards
@@ -328,9 +343,14 @@ def run_etapa2_worker(
 
         queue_patients = read_queue(fila)
         clinical_by_password, field_meta, field_headers = read_clinical(clinica)
-        successful_passwords = read_successful_passwords(relatorio)
-        attempted_passwords: set[str] = set(successful_passwords)
+        # A planilha clínica atual é a fonte de verdade. Um relatório antigo
+        # pode conter pré-lançamentos ou tentativas e não deve bloquear uma
+        # senha que continua explicitamente como AGUARDANDO na base.
+        attempted_passwords: set[str] = set()
         error_passwords: set[str] = set()
+        finalized_statuses = {
+            "FINALIZADO", "SUCESSO", "SUCESSO_COM_ALERTA", "SUCESSO_MANUAL", "JA_LANCADO"
+        }
         for senha, rows in clinical_by_password.items():
             statuses = {
                 value_to_text(row.values.get("Lançamento Salus - Status")).strip().upper()
@@ -338,8 +358,11 @@ def run_etapa2_worker(
             }
             if "ERRO" in statuses:
                 error_passwords.add(senha)
-            if any(statuses):
+            if statuses & finalized_statuses:
                 attempted_passwords.add(senha)
+
+        if not retry_errors:
+            attempted_passwords.update(error_passwords)
 
         if retry_errors:
             # Um erro anterior não significa lançamento concluído. Retira apenas
@@ -408,8 +431,8 @@ def run_etapa2_worker(
                 # painel permanece como "Em lançamento" e mostra o cronômetro.
                 started = started_at.get(patient.senha, dt.datetime.now())
                 elapsed_before_finish = (dt.datetime.now() - started).total_seconds()
-                if elapsed_before_finish < 50:
-                    time.sleep(50 - elapsed_before_finish)
+                if elapsed_before_finish < 30:
+                    time.sleep(30 - elapsed_before_finish)
                 persist_patient_status(clinica, patient, result)
                 processed_count += 1
                 # Recalcula também a lista de pendentes imediatamente. Assim,
@@ -424,10 +447,16 @@ def run_etapa2_worker(
                     for row in reversed(STATE["launch_rows"]):
                         if row["senha"] == patient.senha and row["situacao"] == "Em lançamento":
                             row["tempo"] = elapsed_text
-                            row["situacao"] = (
-                                "Pré-lançado" if result.status == "PRE_LANCADO"
-                                else ("Concluído" if result.status not in {"ERRO", "PULADO"} else result.status)
-                            )
+                            if result.status == "PRE_LANCADO":
+                                row["situacao"] = "Pré-lançado"
+                            elif result.status == "AGUARDANDO_CID":
+                                row["situacao"] = "Aguardando CID"
+                            elif result.status == "AGUARDANDO":
+                                row["situacao"] = "Aguardando"
+                            elif result.status in {"SUCESSO", "SUCESSO_COM_ALERTA", "SUCESSO_MANUAL", "JA_LANCADO"}:
+                                row["situacao"] = "Concluído"
+                            else:
+                                row["situacao"] = result.status
                             break
                 log(f"{result.senha} - {result.nome} - {result.status}: {result.mensagem}")
 
@@ -649,6 +678,11 @@ HTML = r"""<!doctype html>
     </section>
 
     <section class="panel pending-list">
+      <div class="launch-title">Aguardando CID</div>
+      <div id="cid_rows"><div class="launch-meta">Nenhuma senha aguardando CID</div></div>
+    </section>
+
+    <section class="panel pending-list">
       <div class="launch-title">Erros para revisar</div>
       <div id="error_rows"><div class="launch-meta">Nenhum erro registrado</div></div>
     </section>
@@ -751,6 +785,11 @@ HTML = r"""<!doctype html>
           return `<div class="launch-row"><div class="launch-name">${escapeHtml(row.nome)}</div><div class="launch-meta">Senha: ${escapeHtml(row.senha)}</div><div class="launch-meta">Iniciais: ${escapeHtml(row.iniciais)}</div><div class="launch-meta">${tempo}</div><div class="launch-status ${statusClass}">${row.situacao}</div></div>`;
         }).join('');
       }
+      const cidPending = state.pending_rows.filter(row => row.status === 'AGUARDANDO_CID');
+      const cidRows = document.getElementById('cid_rows');
+      cidRows.innerHTML = cidPending.length ? cidPending.map(row =>
+        `<div class="pending-row"><div class="launch-name">${escapeHtml(row.nome)}</div><div>Senha: ${escapeHtml(row.senha)}</div><div>${escapeHtml(row.iniciais)}</div><div class="pending-status">AGUARDANDO CID</div><div>${escapeHtml(row.mensagem)}</div></div>`
+      ).join('') : '<div class="launch-meta">Nenhuma senha aguardando CID</div>';
       const errors = state.pending_rows.filter(row => row.status === 'ERRO');
       const errorRows = document.getElementById('error_rows');
       errorRows.innerHTML = errors.length ? errors.map(row =>

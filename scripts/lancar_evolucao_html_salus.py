@@ -55,7 +55,7 @@ def filled_values(clinical_patient: ClinicalPatient) -> dict[str, str]:
         values["Dados da Internação - CID ajustado *"] = values["Dados da Internação - CID de internação *"]
     evolution = values.get("evolucao", "").lower()
     if not values.get("Dados da Internação - Acomodação *"):
-        values["Dados da Internação - Acomodação *"] = "UTI"
+        values["Dados da Internação - Acomodação *"] = "Apartamento / Enfermaria"
     if not values.get("Dados da Internação - Paciente em isolamento? *"):
         values["Dados da Internação - Paciente em isolamento? *"] = "Não"
     if not values.get("Dados da Internação - Queixa *"):
@@ -140,6 +140,13 @@ def filled_values(clinical_patient: ClinicalPatient) -> dict[str, str]:
 
 def infer_cid_from_evolution(text: str) -> str:
     """Infere CID somente quando a evolução declara claramente o diagnóstico."""
+    # Prioriza o código informado pelo próprio profissional na evolução.
+    explicit_cids = re.findall(
+        r"(?i)\bcid\s*[:\-]?\s*([A-Z]\d{2}(?:\.\d{1,2})?)\b",
+        text or "",
+    )
+    if explicit_cids:
+        return explicit_cids[-1].upper()
     normalized = "".join(
         char for char in unicodedata.normalize("NFD", text.lower())
         if unicodedata.category(char) != "Mn"
@@ -1696,6 +1703,43 @@ def run_html_fill(
             raise RuntimeError(f"Página {title} não ficou verde; lote interrompido neste paciente.")
         print(f"HTML: secao {secao} finalizada", flush=True)
 
+    def finish_at_summary(missing_cid: bool) -> dict[str, Any]:
+        open_sec("100008")
+        summary = eval_sec(
+            "100008",
+            """
+            (async () => {
+              const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+              const norm = (value) => String(value ?? '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toLowerCase();
+              const stepItems = [...document.querySelectorAll('.evaluation-stepper__item')];
+              const incompleteSteps = stepItems
+                .filter(item => !item.classList.contains('evaluation-stepper__item--completed') && !item.classList.contains('evaluation-stepper__item--current'))
+                .map(item => item.querySelector('.evaluation-stepper__label')?.innerText?.trim() || 'Página sem nome');
+              const completedSteps = stepItems
+                .filter(item => item.classList.contains('evaluation-stepper__item--completed'))
+                .map(item => item.querySelector('.evaluation-stepper__label')?.innerText?.trim() || 'Página sem nome');
+              const confirmButton = [...document.querySelectorAll('button')].find(b => norm(b.innerText) === 'confirmar evolucao' || norm(b.innerText) === 'confirmar evolução');
+              const confirmEnabled = Boolean(confirmButton && !confirmButton.disabled && incompleteSteps.length === 0);
+              let saved = false;
+              if (__CONFIRMAR__ && confirmEnabled) {
+                confirmButton.click();
+                await sleep(900);
+                const saveButton = [...document.querySelectorAll('button')]
+                  .find(b => norm(b.innerText) === 'salvar e finalizar' || norm(b.innerText).includes('salvar e finalizar'));
+                if (saveButton && !saveButton.disabled) {
+                  saveButton.click();
+                  saved = true;
+                  await sleep(1800);
+                }
+              }
+              return {href: location.href, confirmEnabled, confirmed: Boolean(__CONFIRMAR__ && confirmEnabled), saved, completedSteps, incompleteSteps, summary: document.body.innerText.slice(0, 6000)};
+            })()
+            """.replace("__CONFIRMAR__", "true" if confirmar else "false"),
+        )
+        summary["logs"] = all_logs
+        summary["missingCid"] = missing_cid
+        return summary
+
     open_sec("100001")
     set_input("100001", "#admission-date", date_html(value("Dados da Internação - Data da internação *")))
     click_radio("100001", "admission-accommodation", value("Dados da Internação - Acomodação *"))
@@ -1728,6 +1772,19 @@ def run_html_fill(
         choose_required_multi("100001", "#admission-adjusted-cid", adjusted_cid_value, "CID ajustado")
     set_duration_combo("100001", value("Dados da Internação - Tempo de existência da doença *"), value_or("Dados da Internação - Nomenclatura do tempo de existência da doença *", "Dias"))
     next_sec("100001", allow_incomplete=missing_cid)
+
+    original_status = value_to_text(
+        clinical_patient.values.get("Lançamento Salus - Status")
+    ).strip().upper()
+    original_message = value_to_text(
+        clinical_patient.values.get("Lançamento Salus - Mensagem")
+    ).strip().upper()
+    resume_cid_only = original_status == "AGUARDANDO_CID" or (
+        original_status == "AGUARDANDO" and original_message.startswith("CID ")
+    )
+    if resume_cid_only and not missing_cid:
+        all_logs.append("Fluxo retomado: CID preenchido; demais páginas preservadas")
+        return finish_at_summary(missing_cid)
 
     open_sec("100002")
     click_radio("100002", "physical-exam-general-state", value("Exame Físico - Estado geral *"))
@@ -1935,7 +1992,10 @@ def run_html_fill(
             'input[type="time"]',
             value("Parecer do Auditor - Hora do desfecho * (cond.)"),
         )
-    fill_auditor_history("100005", value_or("Dados da Internação - Acomodação *", "UTI"))
+    fill_auditor_history(
+        "100005",
+        value_or("Dados da Internação - Acomodação *", "Apartamento / Enfermaria"),
+    )
     click_auditor_radio_label("100005", value_or("Parecer do Auditor - Programação de alta * (cond.)", "Sem programação de alta"))
     operator_pending = value("Parecer do Auditor - Pendências da operadora (cond.)")
     if operator_pending:
@@ -1946,41 +2006,7 @@ def run_html_fill(
         clear_operator_pending("100005")
     next_sec("100005")
 
-    open_sec("100008")
-    summary = eval_sec(
-        "100008",
-        """
-        (async () => {
-          const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-          const norm = (value) => String(value ?? '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toLowerCase();
-          const stepItems = [...document.querySelectorAll('.evaluation-stepper__item')];
-          const incompleteSteps = stepItems
-            .filter(item => !item.classList.contains('evaluation-stepper__item--completed') && !item.classList.contains('evaluation-stepper__item--current'))
-            .map(item => item.querySelector('.evaluation-stepper__label')?.innerText?.trim() || 'Página sem nome');
-          const completedSteps = stepItems
-            .filter(item => item.classList.contains('evaluation-stepper__item--completed'))
-            .map(item => item.querySelector('.evaluation-stepper__label')?.innerText?.trim() || 'Página sem nome');
-          const confirmButton = [...document.querySelectorAll('button')].find(b => norm(b.innerText) === 'confirmar evolucao' || norm(b.innerText) === 'confirmar evolução');
-          const confirmEnabled = Boolean(confirmButton && !confirmButton.disabled && incompleteSteps.length === 0);
-          let saved = false;
-          if (__CONFIRMAR__ && confirmEnabled) {
-            confirmButton.click();
-            await sleep(900);
-            const saveButton = [...document.querySelectorAll('button')]
-              .find(b => norm(b.innerText) === 'salvar e finalizar' || norm(b.innerText).includes('salvar e finalizar'));
-            if (saveButton && !saveButton.disabled) {
-              saveButton.click();
-              saved = true;
-              await sleep(1800);
-            }
-          }
-          return {href: location.href, confirmEnabled, confirmed: Boolean(__CONFIRMAR__ && confirmEnabled), saved, completedSteps, incompleteSteps, summary: document.body.innerText.slice(0, 6000)};
-        })()
-        """.replace("__CONFIRMAR__", "true" if confirmar else "false"),
-    )
-    summary["logs"] = all_logs
-    summary["missingCid"] = missing_cid
-    return summary
+    return finish_at_summary(missing_cid)
 
 
 def main() -> int:
