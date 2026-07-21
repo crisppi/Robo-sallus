@@ -169,7 +169,7 @@ def main() -> int:
     parser.add_argument("--user-key", type=int, default=49)
     parser.add_argument("--prestador", type=int, default=113)
     parser.add_argument("--empresa-auditoria", type=int, default=6)
-    parser.add_argument("--tamanho-pagina", type=int, default=500)
+    parser.add_argument("--tamanho-pagina", type=int, default=10)
     parser.add_argument(
         "--nao-arquivar",
         action="store_true",

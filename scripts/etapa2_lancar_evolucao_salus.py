@@ -130,6 +130,35 @@ def is_blank(value: Any) -> bool:
     return False
 
 
+def extract_completed_discharge(text: str) -> tuple[str, str] | None:
+    """Extrai alta efetiva no trecho final, aceitando variações do hospital."""
+    compact = re.sub(r"\s+", " ", value_to_text(text)).strip()
+    tail = compact[-700:]
+    pattern = re.compile(
+        r"\balta(?:\s+hospitalar|\s+para\s+casa)?(?:\s+dia|\s+em)?\s*"
+        r"(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?"
+        r"\s*(?:,|;|-|\b(?:as|às)\b)?\s*(\d{1,2}:\d{2})",
+        flags=re.IGNORECASE,
+    )
+    valid: list[tuple[str, str]] = []
+    for match in pattern.finditer(tail):
+        context = tail[max(0, match.start() - 35):match.start()].lower()
+        if re.search(r"(?:programação|programacao|previsão|previsao)\s+de\s*$", context):
+            continue
+        day, month, year, hour = match.groups()
+        if not year:
+            year = str(dt.date.today().year)
+        elif len(year) == 2:
+            year = "20" + year
+        try:
+            parsed_date = dt.date(int(year), int(month), int(day))
+            parsed_time = dt.datetime.strptime(hour, "%H:%M").time()
+        except ValueError:
+            continue
+        valid.append((parsed_date.strftime("%d/%m/%Y"), parsed_time.strftime("%H:%M")))
+    return valid[-1] if valid else None
+
+
 def value_to_text(value: Any) -> str:
     if value is None:
         return ""
@@ -428,20 +457,12 @@ def read_clinical(path: Path) -> tuple[dict[str, list[ClinicalPatient]], dict[st
             if is_blank(values.get(field)):
                 values[field] = default
 
-        discharge = re.search(
-            r"\balta\s+(\d{2})/(\d{2})(?:/(\d{2,4}))?\s+(\d{1,2}:\d{2})",
-            evolution_text,
-            flags=re.IGNORECASE,
-        )
+        discharge = extract_completed_discharge(evolution_text)
         if discharge:
-            day, month, year, hour = discharge.groups()
-            if not year:
-                year = str(dt.date.today().year)
-            elif len(year) == 2:
-                year = "20" + year
+            discharge_date, hour = discharge
             values["Parecer do Auditor - Paciente permanece internado? *"] = "Não"
             values["Parecer do Auditor - Selecione o desfecho assistencial * (cond.)"] = "Alta melhorada"
-            values["Parecer do Auditor - Data do desfecho * (cond.)"] = f"{day}/{month}/{year}"
+            values["Parecer do Auditor - Data do desfecho * (cond.)"] = discharge_date
             values["Parecer do Auditor - Hora do desfecho * (cond.)"] = hour
         elif value_to_text(values.get("Parecer do Auditor - Paciente permanece internado? *")).lower().startswith("n"):
             required_discharge = [
