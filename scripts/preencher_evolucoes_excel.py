@@ -15,6 +15,8 @@ from pathlib import Path
 
 from openpyxl import load_workbook
 
+from cid_evolucao import infer_adjusted_cid_from_evolution, infer_cid_suggestion
+
 
 def plain(value: object) -> str:
     text = str(value or "")
@@ -226,6 +228,12 @@ def active_drugs(text: str) -> dict[str, str]:
 
 def extract(text: str, days: object) -> dict[str, object]:
     result: dict[str, object] = {}
+    cid, _cid_reason = infer_cid_suggestion(text)
+    if cid:
+        result["Dados da Internação - CID de internação *"] = cid
+        result["Dados da Internação - CID ajustado *"] = (
+            infer_adjusted_cid_from_evolution(text) or cid
+        )
     if days not in (None, ""):
         result["Dados da Internação - Tempo de existência da doença *"] = days
         result["Dados da Internação - Nomenclatura do tempo de existência da doença *"] = "Dias"

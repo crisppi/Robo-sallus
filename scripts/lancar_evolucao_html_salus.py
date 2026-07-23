@@ -28,6 +28,10 @@ from etapa2_lancar_evolucao_salus import (
     value_to_text,
     write_report,
 )
+from cid_evolucao import (
+    infer_adjusted_cid_from_evolution,
+    infer_cid_from_evolution,
+)
 from salus_cdp import DEFAULT_CDP, call_salus_api, evaluate_js, navigate_salus
 from openpyxl import load_workbook
 
@@ -136,45 +140,6 @@ def filled_values(clinical_patient: ClinicalPatient) -> dict[str, str]:
     ):
         values["Conduta Clínica - Tipo de Quimioterapia * (cond.)"] = "Curativa"
     return values
-
-
-def infer_cid_from_evolution(text: str) -> str:
-    """Infere CID somente quando a evolução declara claramente o diagnóstico."""
-    # Prioriza o código informado pelo próprio profissional na evolução.
-    explicit_cids = re.findall(
-        r"(?i)\bcid\s*[:\-]?\s*([A-Z]\d{2}(?:\.\d{1,2})?)\b",
-        text or "",
-    )
-    if explicit_cids:
-        return explicit_cids[-1].upper()
-    normalized = "".join(
-        char for char in unicodedata.normalize("NFD", text.lower())
-        if unicodedata.category(char) != "Mn"
-    )
-    rules = (
-        (("malformacao arteriovenosa", "mav"), "Q28.2"),
-        (("broncoaspir", "bcp aspirativa", "pneumonia aspirativa"), "J69.0"),
-        (("sindrome coronariana aguda", "sca"), "I24.9"),
-        (("avc agudo", "acidente vascular cerebral", "avci"), "I63.9"),
-        (("doenca aterosclerotica", "lesao aterosclerotica", "aterosclerose coronariana"), "I25.1"),
-        (("alteracao de habito intestinal", "alteracao do habito intestinal"), "R19.4"),
-        (("abscesso dentario",), "K04.7"),
-        (("gastroenterocolite",), "A09"),
-    )
-    for terms, cid in rules:
-        if any(term in normalized for term in terms):
-            return cid
-    return ""
-
-
-def infer_adjusted_cid_from_evolution(text: str) -> str:
-    normalized = "".join(
-        char for char in unicodedata.normalize("NFD", text.lower())
-        if unicodedata.category(char) != "Mn"
-    )
-    if any(term in normalized for term in ("area de isquemia recente", "avc isquemico", "avci", "infarto cerebral")):
-        return "I63.9"
-    return ""
 
 
 def build_browser_payload(clinical_patient: ClinicalPatient, confirmar: bool) -> dict[str, Any]:
@@ -644,7 +609,12 @@ def run_html_fill(
           ]);
         }})()
         """
-        logs = evaluate_js(script, cdp_url=cdp_url, url_contains=target_key) or []
+        logs = evaluate_js(
+            script,
+            cdp_url=cdp_url,
+            url_contains=target_key,
+            timeout_seconds=35,
+        ) or []
         if any(log == "proximo solicitado" for log in logs):
             evaluate_js(
                 """
@@ -1368,19 +1338,33 @@ def run_html_fill(
             const original = part.trim();
             const terms = [];
             // O catálogo CID do Salus não encontra códigos digitados com ponto.
-            // Pesquisa primeiro a categoria (J69), depois o código compacto (J690).
-            if (/^[a-z]\d/i.test(original)) {{
-              if (original.includes('.')) terms.push(original.split('.')[0]);
-              terms.push(original.replace(/\./g, ''));
+            // Pesquisa o código compacto e confirma primeiro o código exato;
+            // a categoria sem ponto fica apenas como último fallback.
+            const code = dash > 0 ? part.slice(0, dash).trim() : original;
+            if (/^[a-z]\d/i.test(code)) {{
+              terms.push(code.replace(/\./g, ''));
+              terms.push(code);
+              if (code.includes('.')) terms.push(code.split('.')[0]);
             }}
             terms.push(original);
             if (dash > 0) {{
-              const code = part.slice(0, dash).trim();
-              terms.push(code);
-              if (code.includes('.')) terms.push(code.split('.')[0]);
               terms.push(part.slice(dash + 3).trim());
             }}
             return [...new Set(terms.filter(Boolean))];
+          }};
+          const searchTerms = (part) => {{
+            const dash = part.indexOf(' - ');
+            const original = part.trim();
+            const code = dash > 0 ? part.slice(0, dash).trim() : original;
+            if (!/^[a-z]\d/i.test(code)) return needles(part);
+            // O endpoint de busca do Salus responde rapidamente à categoria
+            // (I50), mas frequentemente não responde a I50.0/I500.
+            return [...new Set([
+              code.includes('.') ? code.split('.')[0] : code,
+              code.replace(/\./g, ''),
+              code,
+              original,
+            ].filter(Boolean))];
           }};
           const complaintFallbacks = (part) => {{
             const p = norm(part);
@@ -1397,15 +1381,43 @@ def run_html_fill(
             return [...new Set(terms)];
           }};
           const isComplaint = {json.dumps(selector)} === '#admission-complaint';
+          const isAdjustedCid = {json.dumps(selector)} === '#admission-adjusted-cid';
           const isSearchCatalog = ['#admission-complaint', '#admission-cid', '#admission-comorbidities', '#admission-adjusted-cid'].includes({json.dumps(selector)});
-          if (isSearchCatalog && hasRealValue(text)) {{
+          const selectionNeedles = (part) => {{
+            const dash = part.indexOf(' - ');
+            const code = (dash > 0 ? part.slice(0, dash) : part).trim();
+            if (/^[a-z]\d/i.test(code)) return [...new Set([code, code.replace(/\./g, '')])];
+            return needles(part);
+          }};
+          const selectedCidCode = () => (text.match(/\b([a-z]\d{{2}}(?:\.\d+)?)\b/i) || [])[1] || '';
+          const cidSelectionMatches = (part) => {{
+            const dash = part.indexOf(' - ');
+            const wanted = norm((dash > 0 ? part.slice(0, dash) : part).trim());
+            const selected = norm(selectedCidCode());
+            return Boolean(selected) && (selected === wanted || (wanted.includes('.') && selected === wanted.split('.')[0]));
+          }};
+          const desiredAlreadySelected = parts.every(part =>
+            isAdjustedCid && /^[a-z]\d/i.test(part.trim())
+              ? cidSelectionMatches(part)
+              : selectionNeedles(part).some(term => text.includes(norm(term)))
+          );
+          if (desiredAlreadySelected) {{
+            return `multiselect ja preenchido: {selector}`;
+          }}
+          if (isSearchCatalog && hasRealValue(text) && !isAdjustedCid) {{
             return `multiselect ja possui valor real: {selector}`;
           }}
-          if (!isComplaint && text.includes('selecionado')) {{
+          if (!isComplaint && text.includes('selecionado') && !isAdjustedCid) {{
             return `multiselect ja preenchido: {selector}`;
           }}
-          if (parts.every(part => needles(part).some(term => text.includes(norm(term))))) {{
-            return `multiselect ja preenchido: {selector}`;
+          if (isAdjustedCid && hasRealValue(text)) {{
+            const clear = trigger.querySelector('[aria-label*="Limpar"], [title*="Limpar"]')
+              || [...trigger.querySelectorAll('span, button')].find(el => norm(el.getAttribute('aria-label') || el.getAttribute('title') || '').includes('limpar'));
+            if (!clear) return `CID ajustado divergente e sem controle para limpar: ${{text}}`;
+            clear.dispatchEvent(new MouseEvent('mousedown', {{bubbles: true}}));
+            clear.click();
+            await sleep(500);
+            text = norm(trigger.innerText);
           }}
           if (isComplaint && text && !text.includes('busque') && !text.includes('selecione')) {{
             const clear = trigger.querySelector('[aria-label*="Limpar"], [title*="Limpar"]')
@@ -1419,12 +1431,15 @@ def run_html_fill(
           const searchParts = isComplaint ? [...parts, ...parts.flatMap(part => complaintFallbacks(part))] : parts;
           const lastSearchPart = searchParts[searchParts.length - 1];
           for (const part of searchParts) {{
-            let search = [...document.querySelectorAll('input[type="text"]')]
-              .reverse().find(el => (norm(el.placeholder).includes('pesquisar') || String(el.id).includes('multi-select-search')) && el.offsetParent !== null);
-            if (!search) {{
-              trigger.click();
-              await sleep(400);
-            }}
+            // Abre explicitamente o catálogo deste campo. Não reutiliza uma
+            // caixa de pesquisa que tenha ficado aberta em outro componente.
+            document.body.click();
+            await sleep(250);
+            trigger.scrollIntoView({{block: 'center'}});
+            trigger.dispatchEvent(new MouseEvent('mousedown', {{bubbles: true}}));
+            trigger.click();
+            await sleep(400);
+            let search = null;
             for (let i = 0; i < 10; i++) {{
               search = [...document.querySelectorAll('input[type="text"]')]
                 .reverse().find(el => (norm(el.placeholder).includes('pesquisar') || String(el.id).includes('multi-select-search')) && el.offsetParent !== null);
@@ -1432,7 +1447,7 @@ def run_html_fill(
               await sleep(300);
             }}
             let option = null;
-            for (const term of needles(part)) {{
+            for (const term of searchTerms(part)) {{
               if (search) {{
                 search.focus();
                 search.value = term;
@@ -1443,15 +1458,22 @@ def run_html_fill(
               for (let i = 0; i < 16; i++) {{
                 const optionCandidates = [
                   ...document.querySelectorAll('button.multi-select__option, [role="option"], li')
-                ].filter(el => !el.disabled && !String(el.className || '').includes('multi-select__trigger'));
-                option = optionCandidates
-                  .find(el => needles(part).some(candidate => norm(el.innerText).includes(norm(candidate))));
+                ].filter(el => el.offsetParent !== null && !el.disabled && !String(el.className || '').includes('multi-select__trigger'));
+                for (const candidate of needles(part)) {{
+                  option = optionCandidates.find(el => norm(el.innerText).includes(norm(candidate)));
+                  if (option) break;
+                }}
                 if (option) break;
                 await sleep(500);
               }}
               if (option) break;
             }}
             if (option) {{
+              option.scrollIntoView({{block: 'center'}});
+              option.dispatchEvent(new PointerEvent('pointerdown', {{bubbles: true}}));
+              option.dispatchEvent(new MouseEvent('mousedown', {{bubbles: true}}));
+              option.dispatchEvent(new PointerEvent('pointerup', {{bubbles: true}}));
+              option.dispatchEvent(new MouseEvent('mouseup', {{bubbles: true}}));
               option.click();
               selectedCount += 1;
             }} else {{
@@ -1493,16 +1515,29 @@ def run_html_fill(
           const parts = {json.dumps([part.strip() for part in raw.split(";") if part.strip()], ensure_ascii=False)};
           const needles = (part) => {{
             const dash = part.indexOf(' - ');
-            const terms = [part.trim()];
-            if (dash > 0) {{
-              const code = part.slice(0, dash).trim();
+            const original = part.trim();
+            const code = dash > 0 ? part.slice(0, dash).trim() : original;
+            const terms = [];
+            if (/^[a-z]\d/i.test(code)) {{
+              terms.push(code.replace(/\./g, ''));
               terms.push(code);
-              if (code.includes('.')) terms.push(code.split('.')[0]);
+            }}
+            terms.push(original);
+            if (dash > 0) {{
               terms.push(part.slice(dash + 3).trim());
             }}
             return [...new Set(terms.filter(Boolean))];
           }};
-          return parts.every(part => needles(part).some(term => text.includes(norm(term))));
+          const selectedCode = (text.match(/\b([a-z]\d{{2}}(?:\.\d+)?)\b/i) || [])[1] || '';
+          return parts.every(part => {{
+            const dash = part.indexOf(' - ');
+            const wantedCode = norm((dash > 0 ? part.slice(0, dash) : part).trim());
+            if (/^[a-z]\d/i.test(wantedCode) && selectedCode) {{
+              return selectedCode === wantedCode
+                || (wantedCode.includes('.') && selectedCode === wantedCode.split('.')[0]);
+            }}
+            return needles(part).some(term => text.includes(norm(term)));
+          }});
         }})()
         """
         return bool(eval_sec(secao, js))
@@ -1711,15 +1746,27 @@ def run_html_fill(
             (async () => {
               const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
               const norm = (value) => String(value ?? '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toLowerCase();
-              const stepItems = [...document.querySelectorAll('.evaluation-stepper__item')];
-              const incompleteSteps = stepItems
-                .filter(item => !item.classList.contains('evaluation-stepper__item--completed') && !item.classList.contains('evaluation-stepper__item--current'))
-                .map(item => item.querySelector('.evaluation-stepper__label')?.innerText?.trim() || 'Página sem nome');
+              let stepItems = [];
+              let incompleteSteps = [];
+              let confirmButton = null;
+              let confirmEnabled = false;
+              // Ao chegar ao resumo por "Próximo", o Angular atualiza o botão
+              // alguns instantes depois da página aparecer. Aguarda apenas esse
+              // estado, sem recarregar nem navegar para trás.
+              for (let attempt = 0; attempt < 40; attempt++) {
+                stepItems = [...document.querySelectorAll('.evaluation-stepper__item')];
+                incompleteSteps = stepItems
+                  .filter(item => !item.classList.contains('evaluation-stepper__item--completed') && !item.classList.contains('evaluation-stepper__item--current'))
+                  .map(item => item.querySelector('.evaluation-stepper__label')?.innerText?.trim() || 'Página sem nome');
+                confirmButton = [...document.querySelectorAll('button')]
+                  .find(b => norm(b.innerText) === 'confirmar evolucao' || norm(b.innerText) === 'confirmar evolução');
+                confirmEnabled = Boolean(confirmButton && !confirmButton.disabled && incompleteSteps.length === 0);
+                if (confirmEnabled) break;
+                await sleep(200);
+              }
               const completedSteps = stepItems
                 .filter(item => item.classList.contains('evaluation-stepper__item--completed'))
                 .map(item => item.querySelector('.evaluation-stepper__label')?.innerText?.trim() || 'Página sem nome');
-              const confirmButton = [...document.querySelectorAll('button')].find(b => norm(b.innerText) === 'confirmar evolucao' || norm(b.innerText) === 'confirmar evolução');
-              const confirmEnabled = Boolean(confirmButton && !confirmButton.disabled && incompleteSteps.length === 0);
               let saved = false;
               if (__CONFIRMAR__ && confirmEnabled) {
                 confirmButton.click();

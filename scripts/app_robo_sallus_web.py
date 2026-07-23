@@ -427,12 +427,7 @@ def run_etapa2_worker(
                         "situacao": "Em lançamento",
                     })
             elif event == "fim" and result:
-                # Ritmo operacional mínimo por paciente. Durante a espera o
-                # painel permanece como "Em lançamento" e mostra o cronômetro.
                 started = started_at.get(patient.senha, dt.datetime.now())
-                elapsed_before_finish = (dt.datetime.now() - started).total_seconds()
-                if elapsed_before_finish < 30:
-                    time.sleep(30 - elapsed_before_finish)
                 persist_patient_status(clinica, patient, result)
                 processed_count += 1
                 # Recalcula também a lista de pendentes imediatamente. Assim,

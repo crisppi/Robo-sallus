@@ -158,11 +158,16 @@ def find_salus_tab(cdp_url: str = DEFAULT_CDP, url_contains: str | None = None) 
     )
 
 
-def evaluate_js(expression: str, cdp_url: str = DEFAULT_CDP, url_contains: str | None = None) -> Any:
+def evaluate_js(
+    expression: str,
+    cdp_url: str = DEFAULT_CDP,
+    url_contains: str | None = None,
+    timeout_seconds: float = 120.0,
+) -> Any:
     tab = find_salus_tab(cdp_url, url_contains=url_contains)
     ws = websocket.create_connection(
         tab.websocket_debugger_url,
-        timeout=120,
+        timeout=timeout_seconds,
         suppress_origin=True,
     )
     try:
@@ -174,12 +179,24 @@ def evaluate_js(expression: str, cdp_url: str = DEFAULT_CDP, url_contains: str |
                 "expression": expression,
                 "awaitPromise": True,
                 "returnByValue": True,
-                "timeout": 120000,
+                "timeout": int(timeout_seconds * 1000),
             },
         }
         ws.send(json.dumps(payload))
+        deadline = time.monotonic() + timeout_seconds
         while True:
-            message = json.loads(ws.recv())
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SalusCdpError(
+                    f"A pagina do Salus nao respondeu em {int(timeout_seconds)} segundos."
+                )
+            ws.settimeout(remaining)
+            try:
+                message = json.loads(ws.recv())
+            except websocket.WebSocketTimeoutException as exc:
+                raise SalusCdpError(
+                    f"A pagina do Salus nao respondeu em {int(timeout_seconds)} segundos."
+                ) from exc
             if message.get("id") != message_id:
                 continue
             if "error" in message:

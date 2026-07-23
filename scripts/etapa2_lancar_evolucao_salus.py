@@ -38,12 +38,17 @@ IDENTITY_HEADERS = {
     "dias internados",
     "id internacao",
     "id internação",
+    "alta (data e hora)",
 }
 
 SUCCESS_STATUSES = {"SUCESSO", "SUCESSO_COM_ALERTA", "SUCESSO_MANUAL"}
 
 
 class AwaitingCidError(RuntimeError):
+    pass
+
+
+class AwaitingDischargeError(RuntimeError):
     pass
 MULTIPLE_TYPES = {"LISTA_MULTIPLA"}
 MULTIPLE_CONTROLS = {"CHECKBOX_MULTI", "MULTISELECT"}
@@ -130,33 +135,145 @@ def is_blank(value: Any) -> bool:
     return False
 
 
+def _outcome_tail(text: str) -> str:
+    """Normaliza apenas o trecho final, onde o hospital registra o desfecho."""
+    compact = re.sub(r"\s+", " ", str(text or "")).strip()
+    compact = unicodedata.normalize("NFKD", compact)
+    compact = "".join(ch for ch in compact if not unicodedata.combining(ch))
+    return compact[-700:]
+
+
+def _parse_outcome_date(day: str, month: str, year: str | None) -> dt.date | None:
+    if not year:
+        year = str(dt.date.today().year)
+    elif len(year) == 2:
+        year = "20" + year
+    try:
+        return dt.date(int(year), int(month), int(day))
+    except ValueError:
+        return None
+
+
+def _is_planned_discharge_context(tail: str, start: int) -> bool:
+    context = tail[max(0, start - 55):start].lower()
+    return bool(
+        re.search(
+            r"(?:programacao|previsao|possibilidade)\s+de\s*$",
+            context,
+        )
+    )
+
+
+DISCHARGE_DATE_PATTERN = re.compile(
+    r"\balta(?:\s+hospitalar|\s+para\s+casa)?"
+    r"(?:\s*[.:;-]\s*)?(?:\s+(?:dia|em))?\s*"
+    r"(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?",
+    flags=re.IGNORECASE,
+)
+
+# O Salus exige hora para registrar o desfecho. Quando a evolucao confirma a
+# alta e informa a data, mas nao traz uma hora valida, usamos um horario
+# tecnico fixo para que o preenchimento seja reproduzivel e auditavel.
+TECHNICAL_DISCHARGE_TIME = "12:00"
+
+
 def extract_completed_discharge(text: str) -> tuple[str, str] | None:
-    """Extrai alta efetiva no trecho final, aceitando variações do hospital."""
-    compact = re.sub(r"\s+", " ", value_to_text(text)).strip()
-    tail = compact[-700:]
+    """Extrai alta efetiva no final, exigindo data e horário válidos."""
+    tail = _outcome_tail(text)
     pattern = re.compile(
-        r"\balta(?:\s+hospitalar|\s+para\s+casa)?(?:\s+dia|\s+em)?\s*"
-        r"(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?"
-        r"\s*(?:,|;|-|\b(?:as|às)\b)?\s*(\d{1,2}:\d{2})",
+        DISCHARGE_DATE_PATTERN.pattern
+        + r"\s*(?:[,.;:/-]|\b(?:as)\b)?\s*(\d{1,2}:\d{2})",
         flags=re.IGNORECASE,
     )
     valid: list[tuple[str, str]] = []
     for match in pattern.finditer(tail):
-        context = tail[max(0, match.start() - 35):match.start()].lower()
-        if re.search(r"(?:programação|programacao|previsão|previsao)\s+de\s*$", context):
+        if _is_planned_discharge_context(tail, match.start()):
             continue
         day, month, year, hour = match.groups()
-        if not year:
-            year = str(dt.date.today().year)
-        elif len(year) == 2:
-            year = "20" + year
+        parsed_date = _parse_outcome_date(day, month, year)
+        if parsed_date is None:
+            continue
         try:
-            parsed_date = dt.date(int(year), int(month), int(day))
             parsed_time = dt.datetime.strptime(hour, "%H:%M").time()
         except ValueError:
             continue
         valid.append((parsed_date.strftime("%d/%m/%Y"), parsed_time.strftime("%H:%M")))
     return valid[-1] if valid else None
+
+
+def extract_incomplete_discharge(text: str) -> tuple[str, str] | None:
+    """Identifica alta efetiva com data, mas sem horário utilizável."""
+    if extract_completed_discharge(text):
+        return None
+    tail = _outcome_tail(text)
+    candidates: list[tuple[str, str]] = []
+    for match in DISCHARGE_DATE_PATTERN.finditer(tail):
+        if _is_planned_discharge_context(tail, match.start()):
+            continue
+        day, month, year = match.groups()
+        parsed_date = _parse_outcome_date(day, month, year)
+        if parsed_date is None:
+            continue
+        remainder = tail[match.end():match.end() + 24]
+        time_match = re.match(r"\s*[,.;:/-]?\s*(\d{1,2}:\d{2})", remainder)
+        invalid_time = time_match.group(1) if time_match else ""
+        if invalid_time:
+            try:
+                dt.datetime.strptime(invalid_time, "%H:%M")
+            except ValueError:
+                pass
+            else:
+                continue
+        candidates.append((parsed_date.strftime("%d/%m/%Y"), invalid_time))
+    return candidates[-1] if candidates else None
+
+
+def extract_completed_death(text: str) -> tuple[str, str] | None:
+    """Extrai óbito quando o final informa alta por óbito e término do atendimento."""
+    tail = _outcome_tail(text)
+    death = re.search(r"\balta\s+por\s+obito\b", tail, flags=re.IGNORECASE)
+    if not death:
+        return None
+    pattern = re.compile(
+        r"data/hora\s+do\s+termino\s+do\s+atendimento\s*:\s*"
+        r"(\d{1,2})/(\d{1,2})/(\d{2,4})\s+(\d{1,2}:\d{2})(?::\d{2})?",
+        flags=re.IGNORECASE,
+    )
+    valid: list[tuple[str, str]] = []
+    for match in pattern.finditer(tail[:death.end()]):
+        day, month, year, hour = match.groups()
+        parsed_date = _parse_outcome_date(day, month, year)
+        if parsed_date is None:
+            continue
+        try:
+            parsed_time = dt.datetime.strptime(hour, "%H:%M").time()
+        except ValueError:
+            continue
+        valid.append((parsed_date.strftime("%d/%m/%Y"), parsed_time.strftime("%H:%M")))
+    return valid[-1] if valid else None
+
+
+def parse_census_discharge(value: Any) -> tuple[str, str] | None:
+    """Converte a data/hora de alta do censo; textos como 'Internado' sao ignorados."""
+    if isinstance(value, dt.datetime):
+        return value.strftime("%d/%m/%Y"), value.strftime("%H:%M")
+    if isinstance(value, dt.date):
+        return None
+    text = value_to_text(value)
+    if not text or normalize(text) == "internado":
+        return None
+    for pattern in (
+        "%d/%m/%Y %H:%M",
+        "%d/%m/%Y %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+    ):
+        try:
+            parsed = dt.datetime.strptime(text, pattern)
+        except ValueError:
+            continue
+        return parsed.strftime("%d/%m/%Y"), parsed.strftime("%H:%M")
+    return None
 
 
 def value_to_text(value: Any) -> str:
@@ -304,6 +421,7 @@ def read_clinical(path: Path) -> tuple[dict[str, list[ClinicalPatient]], dict[st
     iniciais_col = find_column(headers, "Iniciais")
     dias_col = find_column(headers, "Dias internado", "Dias internados")
     id_col = find_column(headers, "ID internação", "ID internacao")
+    census_discharge_col = find_column(headers, "Alta (data e hora)")
 
     meta = read_field_meta(wb)
     options = read_options(wb)
@@ -339,7 +457,8 @@ def read_clinical(path: Path) -> tuple[dict[str, list[ClinicalPatient]], dict[st
             if not active_therapies:
                 values["Conduta Clínica - Terapias Ativas (ex .: fisioterapia, suporte clínico) * *"] = "Não"
         admission_cid = values.get("Dados da Internação - CID de internação *")
-        if not is_blank(admission_cid):
+        adjusted_cid = values.get("Dados da Internação - CID ajustado *")
+        if not is_blank(admission_cid) and is_blank(adjusted_cid):
             # Regra operacional: se não houver mudança diagnóstica
             # explicitamente marcada na geração da base, repetir o CID inicial.
             values["Dados da Internação - CID ajustado *"] = admission_cid
@@ -457,13 +576,38 @@ def read_clinical(path: Path) -> tuple[dict[str, list[ClinicalPatient]], dict[st
             if is_blank(values.get(field)):
                 values[field] = default
 
+        death = extract_completed_death(evolution_text)
         discharge = extract_completed_discharge(evolution_text)
-        if discharge:
+        incomplete_discharge = extract_incomplete_discharge(evolution_text)
+        census_discharge = (
+            parse_census_discharge(ws.cell(row, census_discharge_col).value)
+            if census_discharge_col
+            else None
+        )
+        if death:
+            discharge_date, hour = death
+            values["Parecer do Auditor - Paciente permanece internado? *"] = "Não"
+            values["Parecer do Auditor - Selecione o desfecho assistencial * (cond.)"] = "Óbito"
+            values["Parecer do Auditor - Data do desfecho * (cond.)"] = discharge_date
+            values["Parecer do Auditor - Hora do desfecho * (cond.)"] = hour
+        elif discharge:
             discharge_date, hour = discharge
             values["Parecer do Auditor - Paciente permanece internado? *"] = "Não"
             values["Parecer do Auditor - Selecione o desfecho assistencial * (cond.)"] = "Alta melhorada"
             values["Parecer do Auditor - Data do desfecho * (cond.)"] = discharge_date
             values["Parecer do Auditor - Hora do desfecho * (cond.)"] = hour
+        elif census_discharge:
+            discharge_date, hour = census_discharge
+            values["Parecer do Auditor - Paciente permanece internado? *"] = "Não"
+            values["Parecer do Auditor - Selecione o desfecho assistencial * (cond.)"] = "Alta melhorada"
+            values["Parecer do Auditor - Data do desfecho * (cond.)"] = discharge_date
+            values["Parecer do Auditor - Hora do desfecho * (cond.)"] = hour
+        elif incomplete_discharge:
+            discharge_date, _invalid_hour = incomplete_discharge
+            values["Parecer do Auditor - Paciente permanece internado? *"] = "Não"
+            values["Parecer do Auditor - Selecione o desfecho assistencial * (cond.)"] = "Alta melhorada"
+            values["Parecer do Auditor - Data do desfecho * (cond.)"] = discharge_date
+            values["Parecer do Auditor - Hora do desfecho * (cond.)"] = TECHNICAL_DISCHARGE_TIME
         elif value_to_text(values.get("Parecer do Auditor - Paciente permanece internado? *")).lower().startswith("n"):
             required_discharge = [
                 "Parecer do Auditor - Selecione o desfecho assistencial * (cond.)",
@@ -622,6 +766,24 @@ class SalusExecutor:
     def lancar(self, queue_patient: QueuePatient, clinical_patient: ClinicalPatient, fields: list[PreparedField]) -> list[PreparedField]:
         from lancar_evolucao_html_salus import run_html_fill
 
+        remains_admitted = value_to_text(
+            clinical_patient.values.get("Parecer do Auditor - Paciente permanece internado? *")
+        ).lower()
+        if remains_admitted.startswith("n"):
+            required_discharge = [
+                "Parecer do Auditor - Selecione o desfecho assistencial * (cond.)",
+                "Parecer do Auditor - Data do desfecho * (cond.)",
+                "Parecer do Auditor - Hora do desfecho * (cond.)",
+            ]
+            missing = [
+                field for field in required_discharge
+                if is_blank(clinical_patient.values.get(field))
+            ]
+            if missing:
+                raise AwaitingDischargeError(
+                    "Alta identificada no final da evolução, mas falta data ou horário válido do desfecho."
+                )
+
         result = run_html_fill(
             clinical_patient,
             confirmar=self.confirmar,
@@ -779,6 +941,21 @@ def process_patients(
         if not any(field.status == "ERRO" for field in prepared_fields):
             try:
                 prepared_fields = executor.lancar(queue_patient, clinical_patient, prepared_fields)
+            except AwaitingDischargeError as exc:
+                result = PatientResult(
+                    senha=queue_patient.senha,
+                    nome=queue_patient.nome or clinical_patient.nome,
+                    iniciais=queue_patient.iniciais or clinical_patient.iniciais,
+                    status="AGUARDANDO",
+                    mensagem=str(exc),
+                    campos_preenchidos=[],
+                    campos_ignorados=ignored_fields,
+                    campos_com_erro=[],
+                )
+                results.append(result)
+                if progress_callback:
+                    progress_callback("fim", queue_patient, result)
+                continue
             except AwaitingCidError as exc:
                 result = PatientResult(
                     senha=queue_patient.senha,

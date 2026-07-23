@@ -18,6 +18,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 
 from gerar_lista_pacientes import fetch_patients, pick, save_excel
+from preencher_evolucoes_excel import extract
 from salus_cdp import SalusCdpError
 
 
@@ -53,7 +54,8 @@ def generate_clinical_base(
     template: Path,
     output: Path,
     previous_workbook=None,
-) -> None:
+    evolution_date: dt.date | None = None,
+) -> dict[str, int]:
     if previous_workbook is None and not template.exists():
         raise FileNotFoundError(f"Modelo da base clinica nao encontrado: {template}")
 
@@ -108,6 +110,9 @@ def generate_clinical_base(
         for cell in row:
             cell.value = None
 
+    reused_evolutions = 0
+    derived_rows = 0
+    derived_cells = 0
     for row_number, patient in enumerate(patients, 2):
         for column, style in enumerate(row_style, 1):
             cell = sheet.cell(row_number, column)
@@ -151,12 +156,41 @@ def generate_clinical_base(
                 sheet.cell(row_number, column).value = value
 
         evolution_cell = sheet.cell(row_number, headers["evolucao"])
-        evolution_cell.value = None
-        evolution_cell.fill = PatternFill("solid", fgColor="FFC7CE")
+        previous_evolution = previous.get("evolucao")
+        if previous_evolution not in (None, "") and str(previous_evolution).strip():
+            evolution_cell.value = previous_evolution
+            evolution_cell.fill = PatternFill("solid", fgColor="C6EFCE")
+            reused_evolutions += 1
+
+            evolution_date_column = headers.get("Data da evolução")
+            if evolution_date_column and evolution_date:
+                sheet.cell(row_number, evolution_date_column).value = evolution_date.strftime("%d/%m/%Y")
+
+            inferred_values = extract(str(previous_evolution), values[3])
+            row_writes = 0
+            for header, inferred_value in inferred_values.items():
+                column = headers.get(header)
+                if not column or inferred_value in (None, ""):
+                    continue
+                current_value = sheet.cell(row_number, column).value
+                if current_value in (None, ""):
+                    sheet.cell(row_number, column).value = inferred_value
+                    row_writes += 1
+            if row_writes:
+                derived_rows += 1
+                derived_cells += row_writes
+        else:
+            evolution_cell.value = None
+            evolution_cell.fill = PatternFill("solid", fgColor="FFC7CE")
 
     sheet.auto_filter.ref = f"A1:{sheet.cell(1, sheet.max_column).column_letter}{len(patients) + 1}"
     output.parent.mkdir(parents=True, exist_ok=True)
     workbook.save(output)
+    return {
+        "evolucoes_reaproveitadas": reused_evolutions,
+        "linhas_derivadas": derived_rows,
+        "celulas_derivadas": derived_cells,
+    }
 
 
 def main() -> int:
@@ -165,6 +199,11 @@ def main() -> int:
     )
     parser.add_argument("--data", type=parse_date, default=dt.date.today())
     parser.add_argument("--modelo", type=Path, default=DEFAULT_TEMPLATE)
+    parser.add_argument(
+        "--base-anterior",
+        type=Path,
+        help="Base clinica a reutilizar. Se omitida, usa a base ativa mais recente.",
+    )
     parser.add_argument("--cdp-url", default="http://127.0.0.1:9222")
     parser.add_argument("--user-key", type=int, default=49)
     parser.add_argument("--prestador", type=int, default=113)
@@ -200,25 +239,44 @@ def main() -> int:
                 list(EXPORTS.glob("data_base_lancar*.xlsx"))
                 + list(EXPORTS.glob("data_base_lancamento*.xlsx"))
             )
-            if "antes_" not in path.name.lower()
+            if "antes_" not in path.name.lower() and not path.name.startswith("~$")
         ],
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
-    previous_workbook = load_workbook(active_bases[0]) if active_bases else None
+    previous_date_label = (args.data - dt.timedelta(days=1)).strftime("%d_%m_%Y")
+    canonical_previous_bases = [
+        EXPORTS / f"data_base_lancar_{previous_date_label}.xlsx",
+        EXPORTS / f"data_base_lancamento_{previous_date_label}.xlsx",
+    ]
+    canonical_previous_base = next(
+        (path for path in canonical_previous_bases if path.exists()),
+        None,
+    )
+    previous_base = args.base_anterior or canonical_previous_base or (
+        active_bases[0] if active_bases else None
+    )
+    if previous_base and not previous_base.exists():
+        raise FileNotFoundError(f"Base anterior nao encontrada: {previous_base}")
+    previous_workbook = load_workbook(previous_base) if previous_base else None
     moved = [] if args.nao_arquivar else archive_active_exports()
     save_excel(patients, queue_output)
-    generate_clinical_base(
+    stats = generate_clinical_base(
         patients,
         args.modelo,
         clinical_output,
         previous_workbook=previous_workbook,
+        evolution_date=args.data,
     )
 
     print(f"Arquivos arquivados: {len(moved)}")
     print(f"Fila gerada: {queue_output}")
     print(f"Base gerada: {clinical_output}")
     print(f"Pacientes: {len(patients)}")
+    print(f"Base anterior: {previous_base or 'modelo limpo'}")
+    print(f"Evolucoes reaproveitadas: {stats['evolucoes_reaproveitadas']}")
+    print(f"Linhas preenchidas pela evolucao: {stats['linhas_derivadas']}")
+    print(f"Celulas preenchidas pela evolucao: {stats['celulas_derivadas']}")
     return 0
 
 
