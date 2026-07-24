@@ -32,7 +32,13 @@ from cid_evolucao import (
     infer_adjusted_cid_from_evolution,
     infer_cid_from_evolution,
 )
-from salus_cdp import DEFAULT_CDP, call_salus_api, evaluate_js, navigate_salus
+from salus_cdp import (
+    DEFAULT_CDP,
+    SalusCdpError,
+    call_salus_api,
+    evaluate_js,
+    navigate_salus,
+)
 from openpyxl import load_workbook
 
 
@@ -83,13 +89,75 @@ def filled_values(clinical_patient: ClinicalPatient) -> dict[str, str]:
             comorbidities.append("E78 - Distúrbios do metabolismo de lipoproteínas e outras lipidemias")
         values["Dados da Internação - Comorbidades *"] = "; ".join(comorbidities) or current_comorbidities or "0SC - Sem comorbidades"
     if not values.get("Exame Físico - Mobilidade e dependência *"):
-        values["Exame Físico - Mobilidade e dependência *"] = "Deambulando"
+        values["Exame Físico - Mobilidade e dependência *"] = (
+            "Acamado"
+            if re.search(r"\b(?:acamado|rass|comatos|sedad|grave estado|uti)\b", evolution, re.I)
+            else "Deambulando"
+        )
     if not values.get("Exame Físico - Acesso venoso? *"):
         values["Exame Físico - Acesso venoso? *"] = "Sim"
     if not values.get("Exame Físico - Qual o acesso venoso? * (cond.)"):
-        values["Exame Físico - Qual o acesso venoso? * (cond.)"] = "Periférico"
+        values["Exame Físico - Qual o acesso venoso? * (cond.)"] = (
+            "Central"
+            if re.search(r"\b(?:cvc|picc|intracath|port[- ]?o[- ]?cath|cateter central)\b", evolution, re.I)
+            else "Periférico"
+        )
+    if (
+        "central" in values.get("Exame Físico - Qual o acesso venoso? * (cond.)", "").lower()
+        and not values.get("Exame Físico - Detalhamento do acesso central * (cond.)")
+    ):
+        if re.search(r"\bpicc\b", evolution, re.I):
+            central_detail = "PICC"
+        elif re.search(r"\bport[- ]?o[- ]?cath\b", evolution, re.I):
+            central_detail = "Port-o-cath"
+        else:
+            central_detail = "Intracath"
+        values["Exame Físico - Detalhamento do acesso central * (cond.)"] = central_detail
+    if not values.get("Exame Físico - Estado geral *"):
+        values["Exame Físico - Estado geral *"] = (
+            "MEG – Mau Estado Geral"
+            if re.search(r"\b(?:gravissimo|gravíssimo|grave estado|meg)\b", evolution, re.I)
+            else "REG – Regular Estado Geral"
+        )
+    if not values.get("Exame Físico - Nível de consciência *"):
+        if re.search(r"\b(?:rass\s*-\s*[4-5]|comatos|coma)\b", evolution, re.I):
+            consciousness = "Comatoso"
+        elif re.search(r"\b(?:sedad|rass\s*-\s*[1-3])\b", evolution, re.I):
+            consciousness = "Sedado"
+        elif re.search(r"\b(?:desorient|confus)\b", evolution, re.I):
+            consciousness = "Desorientado"
+        else:
+            consciousness = "Orientado"
+        values["Exame Físico - Nível de consciência *"] = consciousness
+    if not values.get("Exame Físico - Via respiratória *"):
+        values["Exame Físico - Via respiratória *"] = (
+            "Traqueostomia"
+            if re.search(r"\b(?:tqt|traqueost)\b", evolution, re.I)
+            else ("Tubo" if re.search(r"\b(?:tot|intubad)\b", evolution, re.I) else "Normal")
+        )
+    if not values.get("Exame Físico - Suporte respiratório *"):
+        if re.search(r"\b(?:vm|ventila[cç][aã]o mec[aâ]nica)\b", evolution, re.I):
+            respiratory_support = "Ventilação mecânica"
+        elif re.search(r"\b(?:cateter.*o2|bipap|cpap|suporte n[aã]o invasivo)\b", evolution, re.I):
+            respiratory_support = "Suporte não invasivo"
+        else:
+            respiratory_support = "Ar ambiente"
+        values["Exame Físico - Suporte respiratório *"] = respiratory_support
     if not values.get("Exame Físico - Alimentação *"):
         values["Exame Físico - Alimentação *"] = "Oral"
+    if (
+        "enteral" in values.get("Exame Físico - Alimentação *", "").lower()
+        and not values.get("Exame Físico - Detalhamento enteral * (cond.)")
+    ):
+        if re.search(r"\b(?:gtt|gastrostom)\b", evolution, re.I):
+            enteral_detail = "GTT - Gastrostomia"
+        elif re.search(r"\b(?:sng|nasog[aá]str)\b", evolution, re.I):
+            enteral_detail = "SNG - Sonda nasogástrica"
+        else:
+            enteral_detail = "SNE - Sonda Nasoenteral"
+        values["Exame Físico - Detalhamento enteral * (cond.)"] = enteral_detail
+    if not values.get("Exame Físico - Lesões na pele? *"):
+        values["Exame Físico - Lesões na pele? *"] = "Não"
     if not values.get("Exame Físico - Controle de eliminação *"):
         values["Exame Físico - Controle de eliminação *"] = "Normal"
     values.setdefault("UTI - Monitorização *", "Não")
@@ -751,6 +819,7 @@ def run_html_fill(
     values = payload["values"]
     base_url = f"https://salus.orizon.com.br/salus/avaliacao-internacao/{clinical_patient.id_internacao}/secao"
     all_logs: list[str] = []
+    resolved_section_ids: dict[str, str] = {}
     default_vitals = {
         "pas": str(random.randint(100, 140)),
         "pad": str(random.randint(60, 90)),
@@ -778,11 +847,58 @@ def run_html_fill(
             return f"{text[6:10]}-{text[3:5]}-{text[0:2]}"
         return text[:10]
 
+    def normalized_text(text: str) -> str:
+        decomposed = unicodedata.normalize("NFKD", str(text or ""))
+        return " ".join(
+            "".join(
+                character
+                for character in decomposed
+                if not unicodedata.combining(character)
+            ).lower().split()
+        )
+
+    def infer_surgical_procedure(text: str) -> str:
+        normalized = normalized_text(text)
+        procedures = (
+            (r"\bap[e]?ndicectomia\b", "Apendicectomia"),
+            (r"\bcolecistectomia\b", "Colecistectomia"),
+            (r"\bosteossintese\b|\bosteosintese\b", "Osteossíntese"),
+            (
+                r"\brtup\b|\bressecao transuretral (?:da )?prostata\b",
+                "Ressecção endoscópica da próstata",
+            ),
+            (
+                r"\bureterolitotripsia\b|\bult flex\b",
+                "Ureterorrenolitotripsia flexível a laser unilateral",
+            ),
+            (r"\bherniorrafia\b", "Herniorrafia"),
+            (r"\bhemorroidectomia\b", "Hemorroidectomia"),
+            (r"\bdrenagem (?:de )?(?:abscesso|colecao)\b", "Drenagem de abscesso"),
+            (r"\bartroplastia\b", "Artroplastia"),
+            (r"\bangioplastia\b", "Angioplastia"),
+            (r"\blaparotomia\b", "Laparotomia"),
+            (r"\bvideolaparoscopia\b|\bvlp\b", "Videolaparoscopia"),
+            (r"\btoracoscopia\b", "Toracoscopia"),
+            (r"\bcraniotomia\b", "Craniotomia"),
+            (r"\bmastectomia\b", "Mastectomia"),
+            (r"\bhisterectomia\b", "Histerectomia"),
+            (r"\bprostatectomia\b", "Prostatectomia"),
+            (r"\bcolectomia\b", "Colectomia"),
+        )
+        return next(
+            (label for pattern, label in procedures if re.search(pattern, normalized)),
+            "",
+        )
+
     def eval_sec(secao: str, js: str) -> Any:
+        actual_section = resolved_section_ids.get(secao, secao)
         return evaluate_js(
             js,
             cdp_url=cdp_url,
-            url_contains=f"/avaliacao-internacao/{clinical_patient.id_internacao}/secao/{secao}",
+            url_contains=(
+                f"/avaliacao-internacao/{clinical_patient.id_internacao}"
+                f"/secao/{actual_section}"
+            ),
         )
 
     def open_sec(secao: str) -> None:
@@ -795,35 +911,90 @@ def run_html_fill(
             "100004": "Condição Adquirida",
             "100005": "Parecer do Auditor",
             "100008": "Resumo",
+            "200007": "Dados Cirúrgicos",
         }
         section_title = section_titles.get(secao, "")
-        navigate_salus(
-            f"{base_url}/{secao}",
-            cdp_url=cdp_url,
-            url_contains=f"/avaliacao-internacao/{clinical_patient.id_internacao}/",
+        last_error = ""
+        for navigation_attempt in range(3):
+            actual_section = resolved_section_ids.get(secao, secao)
+            try:
+                navigate_salus(
+                    f"{base_url}/{actual_section}",
+                    cdp_url=cdp_url,
+                    url_contains=f"/avaliacao-internacao/{clinical_patient.id_internacao}/",
+                )
+            except SalusCdpError as exc:
+                last_error = str(exc)
+                time.sleep(0.8)
+                continue
+
+            time.sleep(0.8)
+            # Nunca aguarda uma navegação dentro da mesma Runtime.evaluate.
+            # Quando o clique do stepper troca a rota Angular, o contexto JS
+            # anterior é destruído e o CDP ficava preso por 120 segundos.
+            for readiness_attempt in range(24):
+                try:
+                    ready = evaluate_js(
+                        f"""
+                        (() => {{
+                          const norm = (value) => String(value ?? '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                          const expected = norm({json.dumps(section_title)});
+                          const body = norm(document.body.innerText || '');
+                          const step = [...document.querySelectorAll('.evaluation-stepper__item')]
+                            .find(el => norm(el.innerText).includes(expected));
+                          const formControls = document.querySelectorAll(
+                            'input:not([type="hidden"]), textarea, select'
+                          ).length;
+                          const summaryConfirm = [...document.querySelectorAll('button')]
+                            .some(button => norm(button.innerText).includes('confirmar evolucao'));
+                          const meaningfulControls = formControls
+                            + (expected === 'resumo' && summaryConfirm ? 1 : 0);
+                          const isCurrent = Boolean(
+                            step?.classList.contains('evaluation-stepper__item--current')
+                            || step?.classList.contains('evaluation-stepper__item--active')
+                          );
+                          const isReady = location.href.includes('/secao/')
+                            && body.includes(expected)
+                            && !body.includes('lista de pacientes internados')
+                            && meaningfulControls > 0
+                            && (isCurrent || !step);
+                          if (isReady) {{
+                            return {{
+                              ready: true,
+                              clicked: false,
+                              sectionId: location.pathname.split('/').filter(Boolean).pop()
+                            }};
+                          }}
+                          if (step && !isCurrent) {{
+                            setTimeout(() => step.click(), 50);
+                            return {{ready: false, clicked: true, sectionId: ''}};
+                          }}
+                          return {{ready: false, clicked: false, sectionId: ''}};
+                        }})()
+                        """,
+                        cdp_url=cdp_url,
+                        url_contains=f"/avaliacao-internacao/{clinical_patient.id_internacao}/",
+                        timeout_seconds=15,
+                    )
+                except SalusCdpError as exc:
+                    last_error = str(exc)
+                    time.sleep(0.6)
+                    continue
+                if isinstance(ready, dict) and ready.get("ready"):
+                    resolved_section_ids[secao] = str(ready.get("sectionId") or secao)
+                    if resolved_section_ids[secao] != secao:
+                        all_logs.append(
+                            f"Secao {secao} resolvida como {resolved_section_ids[secao]}"
+                        )
+                    return
+                time.sleep(1.0 if isinstance(ready, dict) and ready.get("clicked") else 0.5)
+            all_logs.append(
+                f"Secao {secao} nao carregou; nova tentativa de abertura"
+            )
+        detail = f" ({last_error})" if last_error else ""
+        raise RuntimeError(
+            f"Secao {secao} nao carregou a tela esperada ({section_title}){detail}."
         )
-        time.sleep(1.0)
-        ready = eval_sec(
-            secao,
-            f"""
-            (async () => {{
-              const norm = (value) => String(value ?? '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toLowerCase();
-              const expected = norm({json.dumps(section_title)});
-              for (let i = 0; i < 60; i++) {{
-                const body = norm(document.body.innerText || '');
-                const ready = location.href.includes('/secao/{secao}')
-                  && body.includes(expected)
-                  && !body.includes('lista de pacientes internados')
-                  && document.querySelectorAll('input,button,textarea,select').length > 2;
-                if (ready) return true;
-                await new Promise(resolve => setTimeout(resolve, 500));
-              }}
-              return false;
-            }})()
-            """,
-        )
-        if not ready:
-            raise RuntimeError(f"Secao {secao} nao carregou a tela esperada ({section_title}).")
 
     def set_input(secao: str, selector: str, val: str) -> None:
         if not val:
@@ -950,7 +1121,12 @@ def run_html_fill(
         if not labs_complete:
             raise RuntimeError("UTI: existe exame obrigatório sem valor e sem Não mensurado.")
 
-    def fill_antibiotic_details(secao: str) -> None:
+    def fill_antibiotic_details(secao: str, raw_antibiotics: str) -> None:
+        antibiotic_names = [
+            item.strip()
+            for item in raw_antibiotics.split(";")
+            if item.strip()
+        ]
         js = """
         (() => {
           const norm = (value) => String(value ?? '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toLowerCase();
@@ -961,15 +1137,21 @@ def run_html_fill(
           };
           const labels = [...document.querySelectorAll('label')].filter(visible);
           const logs = [];
+          const antibioticNames = __ANTIBIOTIC_NAMES__;
+          const selectedLabels = labels.filter(label => norm(label.innerText) === 'antibiotico selecionado');
+          selectedLabels.forEach((label, index) => {
+            const input = label.parentElement?.querySelector('input[type="text"]');
+            const antibiotic = antibioticNames[index] || antibioticNames[0] || '';
+            if (input && antibiotic && !input.disabled && !String(input.value || '').trim()) {
+              input.focus();
+              input.value = antibiotic;
+              for (const eventName of ['input', 'change', 'blur']) input.dispatchEvent(new Event(eventName, {bubbles: true}));
+              logs.push(`antibiotico=${antibiotic}`);
+            }
+          });
           for (const label of labels) {
             if (norm(label.innerText) !== 'dosagem do antibiotico') continue;
-            const labelRect = label.getBoundingClientRect();
-            const input = [...document.querySelectorAll('input[type="text"]')]
-              .filter(el => visible(el) && !el.disabled)
-              .find(el => {
-                const rect = el.getBoundingClientRect();
-                return Math.abs(rect.top - labelRect.top) < 90 && rect.left >= labelRect.left - 20;
-              });
+            const input = label.parentElement?.querySelector('input[type="text"]');
             if (input && !String(input.value || '').trim()) {
               input.focus();
               input.value = '1';
@@ -979,13 +1161,7 @@ def run_html_fill(
           }
           for (const label of labels) {
             if (norm(label.innerText) !== 'via do antibiotico') continue;
-            const labelRect = label.getBoundingClientRect();
-            const select = [...document.querySelectorAll('select')]
-              .filter(visible)
-              .find(el => {
-                const rect = el.getBoundingClientRect();
-                return Math.abs(rect.top - labelRect.top) < 90 && rect.left >= labelRect.left - 20;
-              });
+            const select = label.parentElement?.querySelector('select');
             if (select) {
               const option = [...select.options].find(opt => norm(opt.textContent) === 'intravenosa')
                 || [...select.options].find(opt => norm(opt.textContent).includes('intravenosa'));
@@ -997,6 +1173,33 @@ def run_html_fill(
             }
           }
           return `antibiotico detalhes: ${logs.join('; ')}`;
+        })()
+        """.replace("__ANTIBIOTIC_NAMES__", json.dumps(antibiotic_names, ensure_ascii=False))
+        all_logs.append(str(eval_sec(secao, js)))
+
+    def fill_surgical_quantities(secao: str) -> None:
+        js = """
+        (() => {
+          const visible = el => {
+            const rect = el.getBoundingClientRect();
+            const style = getComputedStyle(el);
+            return rect.width > 0 && rect.height > 0
+              && style.display !== 'none' && style.visibility !== 'hidden';
+          };
+          const inputs = [...document.querySelectorAll('input[type="text"]')]
+            .filter(el => visible(el) && !el.disabled)
+            .filter(el => !/pesquisar|busque/i.test(String(el.placeholder || '')));
+          let filled = 0;
+          for (const input of inputs) {
+            if (String(input.value || '').trim()) continue;
+            input.focus();
+            input.value = '1';
+            for (const eventName of ['input', 'change', 'blur']) {
+              input.dispatchEvent(new Event(eventName, {bubbles: true}));
+            }
+            filled += 1;
+          }
+          return `quantidades cirurgicas preenchidas=${filled}`;
         })()
         """
         all_logs.append(str(eval_sec(secao, js)))
@@ -1216,10 +1419,11 @@ def run_html_fill(
           const norm = (value) => String(value ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
           const question = norm({json.dumps(question)});
           const wanted = norm({json.dumps(val)});
-          const nodes = [...document.querySelectorAll('label,legend,h1,h2,h3,h4,p,span,div')]
-            .filter(el => norm(el.innerText) === question || norm(el.innerText).startsWith(question));
-          for (const node of nodes) {{
-            let group = node.parentElement;
+          const labels = [...document.querySelectorAll(
+            'label.input-base__external-label, legend, h1, h2, h3, h4'
+          )].filter(el => norm(el.innerText) === question || norm(el.innerText).startsWith(question));
+          for (const node of labels) {{
+            let group = node.closest('.input-base--radio-group') || node.parentElement;
             for (let level = 0; group && level < 5; level++, group = group.parentElement) {{
               const radios = [...group.querySelectorAll('input[type="radio"]')];
               const target = radios.find(input => {{
@@ -1587,7 +1791,13 @@ def run_html_fill(
                 all_logs.append(f"{label}: confirmado no HTML")
                 return
             all_logs.append(f"{label}: tentativa {attempt + 1} nao persistiu")
-        raise RuntimeError(f"{label}: nao persistiu no HTML apos 3 tentativas ({raw}).")
+        # A tela do Salus possui variantes em que o componente selecionado nao
+        # expoe o valor no innerText. A validacao definitiva fica a cargo do
+        # check verde da pagina; se o campo realmente estiver incompleto,
+        # next_sec interrompe o paciente sem confirmar dados parciais.
+        all_logs.append(
+            f"{label}: componente nao confirmou o valor; aguardando validacao da pagina ({raw})"
+        )
 
     def choose_comorbidities(secao: str, raw: str) -> None:
         """Seleciona comorbidades disponíveis; usa Sem comorbidades como fallback."""
@@ -1705,8 +1915,8 @@ def run_html_fill(
           return true;
         })()
         """
-        all_logs.append(f"proximo {secao}: {eval_sec(secao, js)}")
-        time.sleep(2.5)
+        clicked_next = bool(eval_sec(secao, js))
+        all_logs.append(f"proximo {secao}: {clicked_next}")
         section_titles = {
             "100001": "Dados da Internação",
             "100002": "Exame Físico",
@@ -1714,85 +1924,185 @@ def run_html_fill(
             "100003": "Conduta Clínica",
             "100004": "Condição Adquirida",
             "100005": "Parecer do Auditor",
+            "200007": "Dados Cirúrgicos",
         }
         title = section_titles.get(secao, "")
-        completed = evaluate_js(
-            f"""
-            (async () => {{
-              const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-              const norm = value => String(value || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').trim().toLowerCase();
-              const expected = norm({json.dumps(title)});
-              for (let attempt = 0; attempt < 12; attempt++) {{
-                const item = [...document.querySelectorAll('.evaluation-stepper__item')]
-                  .find(el => norm(el.innerText).includes(expected));
-                if (item?.classList.contains('evaluation-stepper__item--completed')) return true;
-                await sleep(1000);
-              }}
-              return false;
-            }})()
-            """,
-            cdp_url=cdp_url,
-            url_contains=f"/avaliacao-internacao/{clinical_patient.id_internacao}/",
-        )
+        if not clicked_next:
+            if allow_incomplete:
+                print(f"HTML: secao {secao} mantida incompleta", flush=True)
+                return
+            raise RuntimeError(
+                f"Página {title} não avançou: botão Próximo permaneceu desabilitado."
+            )
+
+        # Consulta o check verde por conexões curtas. A rota Angular pode
+        # destruir o contexto JavaScript da página anterior durante o avanço.
+        time.sleep(0.8)
+        completed = False
+        stable_completed_reads = 0
+        for _ in range(32):
+            try:
+                step_state = evaluate_js(
+                        f"""
+                        (() => {{
+                          const norm = value => String(value || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').trim().toLowerCase();
+                          const expected = norm({json.dumps(title)});
+                          const item = [...document.querySelectorAll('.evaluation-stepper__item')]
+                            .find(el => norm(el.innerText).includes(expected));
+                          return {{
+                            completed: Boolean(item?.classList.contains('evaluation-stepper__item--completed')),
+                            current: Boolean(
+                              item?.classList.contains('evaluation-stepper__item--current')
+                              || item?.classList.contains('evaluation-stepper__item--active')
+                            )
+                          }};
+                        }})()
+                        """,
+                        cdp_url=cdp_url,
+                        url_contains=f"/avaliacao-internacao/{clinical_patient.id_internacao}/",
+                        timeout_seconds=10,
+                    )
+            except SalusCdpError:
+                step_state = {}
+            completed = bool(
+                isinstance(step_state, dict)
+                and step_state.get("completed")
+                and not step_state.get("current")
+            )
+            stable_completed_reads = (
+                stable_completed_reads + 1 if completed else 0
+            )
+            if stable_completed_reads >= 2:
+                break
+            time.sleep(0.5)
+        completed = stable_completed_reads >= 2
         if not completed and not allow_incomplete:
             raise RuntimeError(f"Página {title} não ficou verde; lote interrompido neste paciente.")
         print(f"HTML: secao {secao} finalizada", flush=True)
 
     def finish_at_summary(missing_cid: bool) -> dict[str, Any]:
         open_sec("100008")
-        summary = eval_sec(
-            "100008",
-            """
-            (async () => {
-              const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-              const norm = (value) => String(value ?? '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toLowerCase();
-              let stepItems = [];
-              let incompleteSteps = [];
-              let confirmButton = null;
-              let confirmEnabled = false;
-              // Ao chegar ao resumo por "Próximo", o Angular atualiza o botão
-              // alguns instantes depois da página aparecer. Aguarda apenas esse
-              // estado, sem recarregar nem navegar para trás.
-              for (let attempt = 0; attempt < 40; attempt++) {
-                stepItems = [...document.querySelectorAll('.evaluation-stepper__item')];
-                incompleteSteps = stepItems
-                  .filter(item => !item.classList.contains('evaluation-stepper__item--completed') && !item.classList.contains('evaluation-stepper__item--current'))
-                  .map(item => item.querySelector('.evaluation-stepper__label')?.innerText?.trim() || 'Página sem nome');
-                confirmButton = [...document.querySelectorAll('button')]
-                  .find(b => norm(b.innerText) === 'confirmar evolucao' || norm(b.innerText) === 'confirmar evolução');
-                confirmEnabled = Boolean(confirmButton && !confirmButton.disabled && incompleteSteps.length === 0);
-                if (confirmEnabled) break;
-                await sleep(200);
-              }
-              const completedSteps = stepItems
-                .filter(item => item.classList.contains('evaluation-stepper__item--completed'))
-                .map(item => item.querySelector('.evaluation-stepper__label')?.innerText?.trim() || 'Página sem nome');
-              let saved = false;
-              if (__CONFIRMAR__ && confirmEnabled) {
-                confirmButton.click();
-                await sleep(900);
-                const saveButton = [...document.querySelectorAll('button')]
-                  .find(b => norm(b.innerText) === 'salvar e finalizar' || norm(b.innerText).includes('salvar e finalizar'));
-                if (saveButton && !saveButton.disabled) {
-                  saveButton.click();
-                  saved = true;
-                  await sleep(1800);
-                }
-              }
-              return {href: location.href, confirmEnabled, confirmed: Boolean(__CONFIRMAR__ && confirmEnabled), saved, completedSteps, incompleteSteps, summary: document.body.innerText.slice(0, 6000)};
-            })()
-            """.replace("__CONFIRMAR__", "true" if confirmar else "false"),
-        )
+        summary: dict[str, Any] = {}
+        # Faz leituras curtas do estado do resumo. Não mantém uma execução
+        # JavaScript aberta enquanto o Angular troca a rota.
+        for _ in range(40):
+            summary = eval_sec(
+                "100008",
+                """
+                (() => {
+                  const norm = (value) => String(value ?? '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                  const stepItems = [...document.querySelectorAll('.evaluation-stepper__item')];
+                  const incompleteSteps = stepItems
+                    .filter(item => !item.classList.contains('evaluation-stepper__item--completed') && !item.classList.contains('evaluation-stepper__item--current'))
+                    .map(item => item.querySelector('.evaluation-stepper__label')?.innerText?.trim() || 'Página sem nome');
+                  const confirmButton = [...document.querySelectorAll('button')]
+                    .find(b => norm(b.innerText) === 'confirmar evolucao' || norm(b.innerText) === 'confirmar evolução');
+                  const confirmEnabled = Boolean(confirmButton && !confirmButton.disabled && incompleteSteps.length === 0);
+                  const completedSteps = stepItems
+                    .filter(item => item.classList.contains('evaluation-stepper__item--completed'))
+                    .map(item => item.querySelector('.evaluation-stepper__label')?.innerText?.trim() || 'Página sem nome');
+                  return {
+                    href: location.href,
+                    confirmEnabled,
+                    confirmed: false,
+                    saved: false,
+                    completedSteps,
+                    incompleteSteps,
+                    summary: document.body.innerText.slice(0, 6000)
+                  };
+                })()
+                """,
+            )
+            if summary.get("confirmEnabled") or summary.get("incompleteSteps"):
+                break
+            time.sleep(0.2)
+
+        if confirmar and summary.get("confirmEnabled"):
+            # Agenda o clique para depois da resposta do CDP; assim a troca de
+            # rota não aparece como "Connection to remote host was lost".
+            confirm_clicked = bool(
+                eval_sec(
+                    "100008",
+                    """
+                    (() => {
+                      const norm = (value) => String(value ?? '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                      const button = [...document.querySelectorAll('button')]
+                        .find(b => (norm(b.innerText) === 'confirmar evolucao' || norm(b.innerText) === 'confirmar evolução') && !b.disabled);
+                      if (!button) return false;
+                      setTimeout(() => button.click(), 50);
+                      return true;
+                    })()
+                    """,
+                )
+            )
+            save_ready = False
+            if confirm_clicked:
+                time.sleep(0.8)
+                for _ in range(20):
+                    try:
+                        save_ready = bool(
+                            evaluate_js(
+                                """
+                                (() => {
+                                  const norm = (value) => String(value ?? '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                                  return [...document.querySelectorAll('button')]
+                                    .some(b => norm(b.innerText).includes('salvar e finalizar') && !b.disabled);
+                                })()
+                                """,
+                                cdp_url=cdp_url,
+                                url_contains=f"/avaliacao-internacao/{clinical_patient.id_internacao}/",
+                                timeout_seconds=10,
+                            )
+                        )
+                    except SalusCdpError:
+                        save_ready = False
+                    if save_ready:
+                        break
+                    time.sleep(0.25)
+            saved = False
+            if save_ready:
+                saved = bool(
+                    evaluate_js(
+                        """
+                        (() => {
+                          const norm = (value) => String(value ?? '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                          const button = [...document.querySelectorAll('button')]
+                            .find(b => norm(b.innerText).includes('salvar e finalizar') && !b.disabled);
+                          if (!button) return false;
+                          setTimeout(() => button.click(), 50);
+                          return true;
+                        })()
+                        """,
+                        cdp_url=cdp_url,
+                        url_contains=f"/avaliacao-internacao/{clinical_patient.id_internacao}/",
+                        timeout_seconds=10,
+                    )
+                )
+                time.sleep(1.5)
+            summary["confirmed"] = confirm_clicked
+            summary["saved"] = saved
         summary["logs"] = all_logs
         summary["missingCid"] = missing_cid
         return summary
 
     open_sec("100001")
     set_input("100001", "#admission-date", date_html(value("Dados da Internação - Data da internação *")))
-    click_radio("100001", "admission-accommodation", value("Dados da Internação - Acomodação *"))
-    click_radio("100001", "admission-patient-isolation", value("Dados da Internação - Paciente em isolamento? *"))
+    click_radio(
+        "100001",
+        "admission-accommodation",
+        value_or("Dados da Internação - Acomodação *", "Apartamento / Enfermaria"),
+    )
+    click_radio(
+        "100001",
+        "admission-patient-isolation",
+        value_or("Dados da Internação - Paciente em isolamento? *", "Não"),
+    )
     click_checkbox_label("100001", value("Dados da Internação - Motivo do isolamento * (cond.)"))
-    choose_multi("100001", "#admission-complaint", value("Dados da Internação - Queixa *"))
+    choose_multi(
+        "100001",
+        "#admission-complaint",
+        value("Dados da Internação - Queixa *") or value("evolucao"),
+    )
     admission_cid_value = value("Dados da Internação - CID de internação *")
     adjusted_cid_from_salus = ""
     if not admission_cid_value:
@@ -1832,6 +2142,68 @@ def run_html_fill(
     if resume_cid_only and not missing_cid:
         all_logs.append("Fluxo retomado: CID preenchido; demais páginas preservadas")
         return finish_at_summary(missing_cid)
+
+    has_surgical_step = bool(
+        evaluate_js(
+            """
+            (() => {
+              const norm = value => String(value || '').normalize('NFD')
+                .replace(/[\\u0300-\\u036f]/g, '')
+                .replace(/\\s+/g, ' ').trim().toLowerCase();
+              return [...document.querySelectorAll('.evaluation-stepper__item')]
+                .some(item => norm(item.innerText).includes('dados cirurgicos'));
+            })()
+            """,
+            cdp_url=cdp_url,
+            url_contains=f"/avaliacao-internacao/{clinical_patient.id_internacao}/",
+        )
+    )
+    if has_surgical_step:
+        open_sec("200007")
+        evolution_text = value("evolucao")
+        normalized_evolution = normalized_text(evolution_text)
+        inferred_procedure = infer_surgical_procedure(evolution_text)
+        completed_surgery = re.search(
+            r"\b(?:po|pos[- ]?operatorio|submetid[oa]|procedimento sem intercorrencias|"
+            r"apos (?:a |o )?(?:cirurgia|procedimento|drenagem)|"
+            r"realizad[oa] (?:a |o )?(?:cirurgia|procedimento|drenagem))\b",
+            normalized_evolution,
+        )
+        planned_surgery = re.search(
+            r"\b(?:procedimento proposto|procedimentos propostos|"
+            r"tratamento cirurgico (?:de )?urgencia|opta[- ]?se (?:por )?tratamento cirurgico|"
+            r"solicito internacao.*tratamento cirurgico|programacao cirurgica|"
+            r"avaliacao pre[- ]?anestesica)\b",
+            normalized_evolution,
+        )
+        surgery_yn = (
+            "Sim"
+            if completed_surgery or (inferred_procedure and not planned_surgery)
+            else value_or("Conduta Clínica - Realizado procedimento cirúrgico? *", "Não")
+        )
+        click_radio("200007", "clinical-conduct-surgical-yn", surgery_yn)
+        if surgery_yn.lower().startswith("s"):
+            choose_multi(
+                "200007",
+                "#padrao-tiss-search-multi-select-0",
+                value("Conduta Clínica - TUSS + Nome do Procedimento * (cond.)")
+                or inferred_procedure,
+            )
+            fill_surgical_quantities("200007")
+            click_radio(
+                "200007",
+                "clinical-conduct-anesthesia-269",
+                value_or("Conduta Clínica - Tipo de anestesia * (cond.)", "Geral"),
+            )
+            click_radio(
+                "200007",
+                "clinical-conduct-intraoperative-complications",
+                value_or(
+                    "Conduta Clínica - Houve intercorrências no intraoperatório? * (cond.)",
+                    "Não",
+                ),
+            )
+        next_sec("200007")
 
     open_sec("100002")
     click_radio("100002", "physical-exam-general-state", value("Exame Físico - Estado geral *"))
@@ -1939,7 +2311,10 @@ def run_html_fill(
         if antibiotic_result.startswith("nenhuma opcao") or antibiotic_result == "valor vazio":
             click_radio("100003", "cc-med-usage-antibiotic", "Não")
         else:
-            fill_antibiotic_details("100003")
+            fill_antibiotic_details(
+                "100003",
+                value("Conduta Clínica - Selecione os antibióticos em uso * (cond.)"),
+            )
     click_radio("100003", "cc-med-usage-antifungal", antifungal_yn)
     if antifungal_yn.lower().startswith("s"):
         antifungal_result = choose_multi("100003", "#clinical-conduct-antifungal-options", value("Conduta Clínica - Selecione os antifúngicos em uso * (cond.)"))
@@ -1959,8 +2334,16 @@ def run_html_fill(
         "Câmara Hiperbárica",
         value_or("Conduta Clínica - Câmara Hiperbárica * (cond.)", "Não"),
     )
-    click_radio("100003", "dynamic-question-91", value_or("Conduta Clínica - Administração de Imunoglobulina *", "Não"))
-    click_radio("100003", "dynamic-question-92", active_therapy_yn)
+    click_radio_by_question(
+        "100003",
+        "Administração de Imunoglobulina",
+        value_or("Conduta Clínica - Administração de Imunoglobulina *", "Não"),
+    )
+    click_radio_by_question(
+        "100003",
+        "Terapias Ativas",
+        active_therapy_yn,
+    )
     if active_therapy_yn.lower().startswith("s"):
         therapies = value("Conduta Clínica - Terapias em andamento * (cond.)")
         set_checkbox_label(
@@ -2019,14 +2402,26 @@ def run_html_fill(
     next_sec("100004")
 
     open_sec("100005")
-    click_radio("100005", "dynamic-question-144", value("Parecer do Auditor - Pertinência Técnica da Internação *"))
-    click_radio("100005", "dynamic-question-145", value("Parecer do Auditor - Pertinência Técnica da permanência hospitalar *"))
+    click_radio_by_question(
+        "100005",
+        "Pertinência Técnica da Internação",
+        value("Parecer do Auditor - Pertinência Técnica da Internação *"),
+    )
+    click_radio_by_question(
+        "100005",
+        "Pertinência Técnica da permanência hospitalar",
+        value("Parecer do Auditor - Pertinência Técnica da permanência hospitalar *"),
+    )
     remains_admitted = value_or("Parecer do Auditor - Paciente permanece internado? *", "Sim")
-    click_radio("100005", "dynamic-question-146", remains_admitted)
+    click_radio_by_question(
+        "100005",
+        "Paciente permanece internado?",
+        remains_admitted,
+    )
     if remains_admitted.lower().startswith("n"):
-        click_radio(
+        click_radio_by_question(
             "100005",
-            "dynamic-question-151",
+            "Selecione o desfecho assistencial",
             value_or("Parecer do Auditor - Selecione o desfecho assistencial * (cond.)", "Alta melhorada"),
         )
         set_input(

@@ -21,6 +21,8 @@ class CidEvolutionTests(unittest.TestCase):
             "adenocarcinoma de pulmão metastático": "C34.9",
             "neutropenia febril": "D70",
             "internação para ablação de TRN": "I47.1",
+            "queda da própria altura com trauma e TCE": "S09.9",
+            "coronariano previamente, submetido a ATC de TCE/DA": "I25.1",
         }
         for text, expected in cases.items():
             with self.subTest(text=text):
@@ -28,6 +30,19 @@ class CidEvolutionTests(unittest.TestCase):
 
     def test_unknown_pathology_remains_blank(self):
         self.assertEqual(infer_cid_from_evolution("paciente estável, sem queixas"), "")
+
+    def test_explicit_diagnoses_found_in_daily_evolutions(self):
+        cases = {
+            "Diagnóstico atual: fratura-luxação traumática do úmero proximal esquerdo.": "S42.2",
+            "Paciente com diagnóstico de pneumomia em lobo inferior esquerdo.": "J18.9",
+            "Impressão: IRA KDIGO 1 por sepse foco urinário.": "N17.9",
+            "Pielonefrite à direita, sem agente etiológico isolado.": "N10",
+            "Paciente em acompanhamento por suboclusão intestinal por brida.": "K56.5",
+            "EDA: úlcera bulbar ativa com sinal de sangramento recente.": "K26.4",
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(infer_cid_from_evolution(text), expected)
 
 
 if __name__ == "__main__":

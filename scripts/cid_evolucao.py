@@ -28,7 +28,50 @@ def infer_cid_suggestion(text: str) -> tuple[str, str]:
         return explicit_cids[-1].upper(), "CID explícito na evolução"
 
     value = normalized(raw)
+    padded = f" {value} "
+    if (
+        (
+            re.search(r"\btce\b", value)
+            or any(term in padded for term in (" traumatismo craniano ", " trauma craniano "))
+        )
+        and any(term in padded for term in (" queda ", " trauma ", " colisao "))
+    ):
+        return "S09.9", "traumatismo craniano sem lesão mais específica descrita"
+
     rules: tuple[tuple[tuple[str, ...], str, str], ...] = (
+        (("fratura-luxacao traumatica", "fratura do umero proximal"), "S42.2", "fratura da extremidade superior do úmero"),
+        (("fratura do extremo distal do radio", "fratura distal do radio"), "S52.5", "fratura da extremidade distal do rádio"),
+        (("fratura do sacro", "fratura sacral"), "S32.1", "fratura do sacro"),
+        (("lesao osteocondral no joelho",), "M93.2", "lesão osteocondral do joelho"),
+        (("suboclusao intestinal por brida", "obstrucao intestinal por brida"), "K56.5", "aderência intestinal com obstrução"),
+        (("ulcera bulbar ativa com sinal de sangramento",), "K26.4", "úlcera duodenal com hemorragia"),
+        (("colica biliar reentrante",), "K80.2", "cálculo da vesícula biliar sem colecistite"),
+        (("neoplasia de esofago distal", "adenocarcinoma estenosante"), "C15.5", "neoplasia maligna do terço inferior do esôfago"),
+        (("melanoma metastatico",), "C43.9", "melanoma maligno de pele, sítio primário não especificado"),
+        (("sindrome desmielinizante", "sd. desmielinizante"), "G37.9", "doença desmielinizante do sistema nervoso central"),
+        (("hidrocefalia de pressao normal",), "G91.2", "hidrocefalia de pressão normal"),
+        (("encefalopatia hepatica",), "K72.9", "insuficiência hepática com encefalopatia não especificada"),
+        (("ira kdigo", "insuficiencia renal aguda", " ira - tsr"), "N17.9", "insuficiência renal aguda"),
+        (("pielonefrite",), "N10", "pielonefrite aguda"),
+        (
+            (
+                "nova infeccao urinaria",
+                "internada por itu",
+                "internado por itu",
+                "sintomas sugestivos de infeccao do trato urinario",
+                "sintoma sugestivos de infeccao do trato urinario",
+                "urocultura e coli",
+            ),
+            "N39.0",
+            "infecção do trato urinário",
+        ),
+        (("diagnostico de pneumomia", "tc torax com pneumonia", "pneumonia + sinusite"), "J18.9", "pneumonia não especificada"),
+        (("placa mole na origem da asce", "placa na origem da arteria subclavia"), "I70.8", "aterosclerose de outra artéria"),
+        (("lombalgia cronica", "ciatalgia intensa"), "M54.4", "lumbago com ciática"),
+        (("candidiase", "candidiase oral"), "B37.0", "candidíase oral"),
+        (("noto humor depressivo",), "F32.9", "episódio depressivo não especificado"),
+        (("rash cutaneo cranio-caudal",), "R21", "erupção cutânea não especificada"),
+        (("dor abdominal leve e nausea",), "R10.4", "dor abdominal não especificada"),
         (("isquemia mesenterica", "perfuracao de alca"), "K55.0", "isquemia mesentérica aguda"),
         (("choque septico refratario",), "R57.2", "choque séptico"),
         (("apendicectomia", "apendicite aguda"), "K35.9", "apendicite tratada por apendicectomia"),
@@ -36,7 +79,20 @@ def infer_cid_suggestion(text: str) -> tuple[str, str]:
         (("pneumonia bacteriana", "broncopneumonia", "opacidades pulmonares"), "J18.9", "pneumonia não especificada"),
         (("virus sincicial respiratorio", "vsr positivos", "vsr positivo"), "J21.0", "bronquiolite por VSR"),
         (("sindrome coronariana aguda", " sca "), "I24.9", "síndrome coronariana aguda"),
-        (("aterosclerose coronariana", "lesao coronariana", "doenca aterosclerotica"), "I25.1", "doença aterosclerótica do coração"),
+        (
+            (
+                "aterosclerose coronariana",
+                "lesao coronariana",
+                "lesoes coronarianas",
+                "doenca aterosclerotica",
+                "doenca arterial coronariana",
+                "coronariano previamente",
+                "atc de tce",
+                " dac ",
+            ),
+            "I25.1",
+            "doença aterosclerótica do coração",
+        ),
         (("estenose aortica", "tavi"), "I35.0", "estenose aórtica"),
         (("ablacao de trn", "taquicardia por reentrada nodal"), "I47.1", "taquicardia supraventricular"),
         (("avc isquemico", "avci", "multiplos focos isquemicos", "infarto cerebral"), "I63.9", "infarto cerebral"),
@@ -70,7 +126,6 @@ def infer_cid_suggestion(text: str) -> tuple[str, str]:
         (("gastroenterocolite",), "A09", "gastroenterocolite"),
         (("cansaco", "fadiga", "mal estar inespecifico"), "R53", "mal-estar e fadiga"),
     )
-    padded = f" {value} "
     for terms, cid, reason in rules:
         if any(term in padded for term in terms):
             return cid, reason

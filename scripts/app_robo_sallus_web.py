@@ -59,6 +59,8 @@ def default_state() -> dict:
         "current_patient": "Nenhum paciente em execucao",
         "current_password": "-",
         "processed_now": 0,
+        "execution_started_at": None,
+        "execution_finished_at": None,
         "launch_rows": [],
         "pending_rows": [],
         "logs": [],
@@ -478,7 +480,10 @@ def run_etapa2_worker(
         set_state(status="Erro na Etapa 2")
         log(f"ERRO: {exc}")
     finally:
-        set_state(running=False)
+        set_state(
+            running=False,
+            execution_finished_at=dt.datetime.now().isoformat(),
+        )
 
 
 HTML = r"""<!doctype html>
@@ -539,20 +544,6 @@ HTML = r"""<!doctype html>
       padding: 16px;
       margin-bottom: 16px;
     }
-    .files {
-      display: grid;
-      grid-template-columns: 140px 1fr;
-      gap: 5px 10px;
-      align-items: center;
-      padding: 9px 14px;
-      margin-bottom: 10px;
-    }
-    .files label { font-size: 13px; }
-    .files input[type="text"] {
-      padding: 6px 10px;
-      font-size: 13px;
-      height: 32px;
-    }
     label { font-weight: 650; color: #374151; }
     input[type="text"] {
       width: 100%;
@@ -576,7 +567,7 @@ HTML = r"""<!doctype html>
     button.secondary { background: #4b5563; }
     button:disabled { opacity: .55; cursor: wait; }
     .check { color: var(--danger); font-weight: 750; display: flex; gap: 8px; align-items: center; }
-    .cards { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; }
+    .cards { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; }
     .card {
       background: #fff;
       border: 1px solid var(--line);
@@ -621,7 +612,6 @@ HTML = r"""<!doctype html>
     @media (max-width: 900px) {
       .cards { grid-template-columns: repeat(2, 1fr); }
       .launch-row { grid-template-columns: 1fr 1fr; }
-      .files { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -633,14 +623,9 @@ HTML = r"""<!doctype html>
     </div>
     <p class="sub">Novo dia arquiva o lote anterior e prepara as listas. Etapa 2 lança automaticamente as evoluções no Salus. &nbsp; <a class="nav-link" href="/pre-lancamentos">Pré-lançamentos</a> &nbsp; <a class="nav-link" href="/controle-diario">Controle diário →</a></p>
 
-    <section class="panel files">
-      <label>Fila Salus</label>
-      <input id="fila" type="text">
-      <label>Planilha Clínica</label>
-      <input id="clinica" type="text">
-      <label>Relatório</label>
-      <input id="relatorio" type="text">
-    </section>
+    <input id="fila" type="hidden">
+    <input id="clinica" type="hidden">
+    <input id="relatorio" type="hidden">
 
     <section class="panel actions">
       <button id="novoDia" onclick="startNewDay()">Novo dia</button>
@@ -665,6 +650,7 @@ HTML = r"""<!doctype html>
       <div class="card"><div class="title">Senhas encontradas</div><div id="encontrados" class="value">-</div></div>
       <div class="card"><div class="title">Faltam lançar</div><div id="faltam" class="value">-</div></div>
       <div class="card"><div class="title">Processados agora</div><div id="processed" class="value">0</div></div>
+      <div class="card"><div class="title">Tempo total de execução</div><div id="total_timer" class="value">00:00:00</div></div>
     </section>
 
     <section class="current">
@@ -762,6 +748,12 @@ HTML = r"""<!doctype html>
       document.getElementById('encontrados').textContent = state.cards.encontrados;
       document.getElementById('faltam').textContent = state.cards.faltam;
       document.getElementById('processed').textContent = state.processed_now;
+      const timerEnd = state.running ? Date.now() : (state.execution_finished_at ? new Date(state.execution_finished_at).getTime() : Date.now());
+      document.getElementById('total_timer').textContent = formatDuration(
+        state.execution_started_at
+          ? Math.max(0, Math.floor((timerEnd - new Date(state.execution_started_at).getTime()) / 1000))
+          : 0
+      );
       const robotStamp = document.getElementById('robot_stamp');
       robotStamp.textContent = state.running ? 'ROBÔ EM EXECUÇÃO' : 'ROBÔ PARADO';
       robotStamp.classList.toggle('running', state.running);
@@ -770,7 +762,12 @@ HTML = r"""<!doctype html>
         launchRows.innerHTML = '<div class="launch-meta">Nenhum paciente em execução</div>';
       } else {
         const now = Date.now();
-        launchRows.innerHTML = state.launch_rows.map(row => {
+        const orderedLaunchRows = [...state.launch_rows].sort((a, b) => {
+          const activeDifference = Number(b.situacao === 'Em lançamento') - Number(a.situacao === 'Em lançamento');
+          if (activeDifference) return activeDifference;
+          return launchTimestamp(b) - launchTimestamp(a);
+        });
+        launchRows.innerHTML = orderedLaunchRows.map(row => {
           let tempo = row.tempo;
           if (row.situacao === 'Em lançamento') {
             const seconds = Math.max(0, Math.floor((now - new Date(row.inicio).getTime()) / 1000));
@@ -800,6 +797,27 @@ HTML = r"""<!doctype html>
 
     function escapeHtml(value) {
       return String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[char]));
+    }
+
+    function launchTimestamp(row) {
+      if (row.inicio) return new Date(row.inicio).getTime();
+      const match = String(row.tempo || '').match(/^(\d{2})\/(\d{2})\/(\d{4})\s+(\d{2}):(\d{2}):(\d{2})$/);
+      if (!match) return 0;
+      return new Date(
+        Number(match[3]),
+        Number(match[2]) - 1,
+        Number(match[1]),
+        Number(match[4]),
+        Number(match[5]),
+        Number(match[6])
+      ).getTime();
+    }
+
+    function formatDuration(totalSeconds) {
+      const hours = Math.floor(totalSeconds / 3600);
+      const minutes = Math.floor((totalSeconds % 3600) / 60);
+      const seconds = totalSeconds % 60;
+      return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
     }
 
     setInterval(poll, 1200);
@@ -991,6 +1009,8 @@ class Handler(BaseHTTPRequestHandler):
                         return
                     STATE["running"] = True
                     STATE["processed_now"] = 0
+                    STATE["execution_started_at"] = dt.datetime.now().isoformat()
+                    STATE["execution_finished_at"] = None
                     STATE["status"] = "Executando Etapa 2"
                     STATE["current_patient"] = "Iniciando..."
                     STATE["current_password"] = "-"

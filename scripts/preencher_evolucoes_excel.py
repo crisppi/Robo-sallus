@@ -14,8 +14,17 @@ import unicodedata
 from pathlib import Path
 
 from openpyxl import load_workbook
+from openpyxl.styles import Font, PatternFill
 
 from cid_evolucao import infer_adjusted_cid_from_evolution, infer_cid_suggestion
+from etapa2_lancar_evolucao_salus import (
+    EVOLUTION_DISCHARGE_FILL,
+    EVOLUTION_DISCHARGE_FONT,
+    discharge_as_datetime,
+    parse_census_discharge,
+    resolve_discharge,
+    resolve_evolution_discharge,
+)
 
 
 def plain(value: object) -> str:
@@ -145,7 +154,11 @@ def access_and_elimination(text: str) -> dict[str, str]:
     normalized = plain(text)
     result: dict[str, str] = {}
     central = []
-    if re.search(r"\bpicc\b", normalized): central.append("PICC")
+    if re.search(
+        r"\b(?:picc|cateter venoso central de insercao periferica)\b",
+        normalized,
+    ):
+        central.append("PICC")
     if re.search(r"\bport[- ]?a[- ]?cath\b", normalized): central.append("Port-o-cath")
     if re.search(r"\b(?:cvc|cateter venoso central|permcath|cateter hd)\b", normalized): central.append("CVC")
     if central:
@@ -221,12 +234,24 @@ def active_drugs(text: str) -> dict[str, str]:
                 cleaned = re.sub(r"\bvanco\b", "Vancomicina", cleaned, flags=re.I)
                 expanded.extend(part.strip() for part in cleaned.split("+") if part.strip())
             result["Conduta Clínica - Uso de antibiótico? *"] = "Sim"
-            result["Conduta Clínica - Selecione os antibióticos em uso * (cond.)"] = "; ".join(dict.fromkeys(expanded))
+            selected = "; ".join(dict.fromkeys(expanded))
+            result["Conduta Clínica - Selecione os antibióticos em uso * (cond.)"] = selected
+            # O Salus abre um campo obrigatório "Antibiótico selecionado"
+            # após a escolha no catálogo. O mesmo nome explícito da evolução
+            # deve acompanhar a linha para o preenchimento diário.
+            result["Conduta Clínica - Antibiótico selecionado * (cond.)"] = selected
         break
     return result
 
 
-def extract(text: str, days: object) -> dict[str, object]:
+def extract(
+    text: str,
+    days: object,
+    *,
+    census_discharge: object = None,
+    evolution_date: object = None,
+    seed: str = "",
+) -> dict[str, object]:
     result: dict[str, object] = {}
     cid, _cid_reason = infer_cid_suggestion(text)
     if cid:
@@ -266,6 +291,18 @@ def extract(text: str, days: object) -> dict[str, object]:
     result.update(respiratory(text))
     result.update(access_and_elimination(text))
     result.update(active_drugs(text))
+    discharge = resolve_discharge(
+        text,
+        census_value=census_discharge,
+        evolution_date=evolution_date,
+        seed=seed,
+    )
+    if discharge:
+        discharge_date, hour, outcome = discharge
+        result["Parecer do Auditor - Paciente permanece internado? *"] = "Não"
+        result["Parecer do Auditor - Selecione o desfecho assistencial * (cond.)"] = outcome
+        result["Parecer do Auditor - Data do desfecho * (cond.)"] = discharge_date
+        result["Parecer do Auditor - Hora do desfecho * (cond.)"] = hour
     return result
 
 
@@ -277,6 +314,11 @@ def main() -> int:
         "--somente-vazios",
         action="store_true",
         help="Preenche apenas células vazias, preservando valores já revisados.",
+    )
+    parser.add_argument(
+        "--atualizar-altas",
+        action="store_true",
+        help="Atualiza os campos de alta e a coluna Alta (data e hora).",
     )
     args = parser.parse_args()
 
@@ -291,19 +333,79 @@ def main() -> int:
     written_cells = 0
     for row in range(2, sheet.max_row + 1):
         text = str(sheet.cell(row, evolution_column).value or "").strip()
-        if not text:
+        census_value = (
+            sheet.cell(row, headers["Alta (data e hora)"]).value
+            if "Alta (data e hora)" in headers
+            else None
+        )
+        if not text and census_value in (None, ""):
             continue
-        values = extract(text, sheet.cell(row, headers["Dias internado"]).value)
+        values = extract(
+            text,
+            sheet.cell(row, headers["Dias internado"]).value,
+            census_discharge=census_value,
+            evolution_date=(
+                sheet.cell(row, headers["Data da evolução"]).value
+                if "Data da evolução" in headers
+                else None
+            ),
+            seed=(
+                str(sheet.cell(row, headers["Senha"]).value or "").strip()
+                if "Senha" in headers
+                else ""
+            ),
+        )
+        evolution_discharge = resolve_evolution_discharge(
+            text,
+            evolution_date=(
+                sheet.cell(row, headers["Data da evolução"]).value
+                if "Data da evolução" in headers
+                else None
+            ),
+            seed=(
+                str(sheet.cell(row, headers["Senha"]).value or "").strip()
+                if "Senha" in headers
+                else ""
+            ),
+        )
+        if args.atualizar_altas:
+            discharge_headers = {
+                "Parecer do Auditor - Paciente permanece internado? *",
+                "Parecer do Auditor - Selecione o desfecho assistencial * (cond.)",
+                "Parecer do Auditor - Data do desfecho * (cond.)",
+                "Parecer do Auditor - Hora do desfecho * (cond.)",
+            }
+            values = {
+                header: value
+                for header, value in values.items()
+                if header in discharge_headers
+            }
         row_writes = 0
         for header, value in values.items():
             column = headers.get(header)
             if column and value not in (None, ""):
-                if args.somente_vazios:
+                if args.somente_vazios and not args.atualizar_altas:
                     current = sheet.cell(row, column).value
                     if current is not None and str(current).strip():
                         continue
                 sheet.cell(row, column).value = value
                 row_writes += 1
+
+        # A data/hora obtida da evolução fica gravada na mesma coluna do
+        # censo, mas em laranja. Uma alta real do censo nunca é sobrescrita.
+        high_column = headers.get("Alta (data e hora)")
+        evolution_datetime = discharge_as_datetime(evolution_discharge)
+        if (
+            high_column
+            and evolution_datetime
+            and parse_census_discharge(census_value) is None
+        ):
+            high_cell = sheet.cell(row, high_column)
+            high_cell.value = evolution_datetime
+            high_cell.number_format = "dd/mm/yyyy hh:mm"
+            high_cell.fill = PatternFill("solid", fgColor=EVOLUTION_DISCHARGE_FILL)
+            high_cell.font = Font(color=EVOLUTION_DISCHARGE_FONT, bold=True)
+            row_writes += 1
         if row_writes:
             changed_rows += 1
             written_cells += row_writes

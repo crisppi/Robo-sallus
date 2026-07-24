@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -42,6 +43,8 @@ IDENTITY_HEADERS = {
 }
 
 SUCCESS_STATUSES = {"SUCESSO", "SUCESSO_COM_ALERTA", "SUCESSO_MANUAL"}
+EVOLUTION_DISCHARGE_FILL = "F4B183"
+EVOLUTION_DISCHARGE_FONT = "9C5700"
 
 
 class AwaitingCidError(RuntimeError):
@@ -155,10 +158,21 @@ def _parse_outcome_date(day: str, month: str, year: str | None) -> dt.date | Non
 
 
 def _is_planned_discharge_context(tail: str, start: int) -> bool:
-    context = tail[max(0, start - 55):start].lower()
+    context = tail[max(0, start - 90):start].lower()
     return bool(
         re.search(
-            r"(?:programacao|previsao|possibilidade)\s+de\s*$",
+            r"(?:"
+            r"(?:programacao|previsao|possibilidade|planejamento)\s+de|"
+            r"(?:possivel|provavel)|"
+            r"plano(?:\s+de)?|"
+            r"(?:avaliar|reavaliar|aguardando|pendente|candidato|apto)\s+(?:para\s+)?|"
+            r"(?:sem\s+contraindicacoes|condicoes)\s+para|"
+            r"(?:antes\s+(?:da|de)|apos\s+a|na|para|pos)|"
+            r"(?:relatorio|orientacoes)\s+de|"
+            r"de\s+acordo\s+com|"
+            r"alta\s+a\s+criterio\s+de|"
+            r"traqueia"
+            r")\s*$",
             context,
         )
     )
@@ -171,10 +185,73 @@ DISCHARGE_DATE_PATTERN = re.compile(
     flags=re.IGNORECASE,
 )
 
-# O Salus exige hora para registrar o desfecho. Quando a evolucao confirma a
-# alta e informa a data, mas nao traz uma hora valida, usamos um horario
-# tecnico fixo para que o preenchimento seja reproduzivel e auditavel.
-TECHNICAL_DISCHARGE_TIME = "12:00"
+def technical_discharge_time(seed: str = "") -> str:
+    """Gera horário técnico estável entre 08:00 e 12:30, inclusive."""
+    digest = hashlib.sha256(str(seed or "alta").encode("utf-8")).digest()
+    minute_offset = int.from_bytes(digest[:4], "big") % 271
+    total_minutes = (8 * 60) + minute_offset
+    return f"{total_minutes // 60:02d}:{total_minutes % 60:02d}"
+
+
+def parse_evolution_date(value: Any) -> str | None:
+    """Converte a data da evolução para DD/MM/AAAA."""
+    if isinstance(value, dt.datetime):
+        return value.strftime("%d/%m/%Y")
+    if isinstance(value, dt.date):
+        return value.strftime("%d/%m/%Y")
+    text = value_to_text(value)
+    if not text:
+        return None
+    for pattern in (
+        "%d/%m/%Y",
+        "%d/%m/%y",
+        "%Y-%m-%d",
+        "%Y-%m-%d %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+    ):
+        try:
+            return dt.datetime.strptime(text, pattern).strftime("%d/%m/%Y")
+        except ValueError:
+            continue
+    return None
+
+
+def has_effective_discharge_at_end(text: str) -> bool:
+    """Reconhece alta efetiva no fim e rejeita previsão/transferência/condição."""
+    tail = _outcome_tail(text)
+    for match in re.finditer(r"\balta\b", tail, flags=re.IGNORECASE):
+        if _is_planned_discharge_context(tail, match.start()):
+            continue
+        before = tail[max(0, match.start() - 90):match.start()].lower()
+        after = tail[match.end():match.end() + 90].lower()
+        if re.match(
+            r"\s+(?:"
+            r"para|da|de"
+            r")\s+(?:uti|uco|ucg|ui|(?:\d+\s*[oº]?\s*)?andar|apartamento|apto|enfermaria|unidade|leito)\b",
+            after,
+        ):
+            continue
+        if re.match(r"\s+(?:uti|uco|ucg|ui)\b", after):
+            continue
+        if re.match(
+            r"\s+(?:"
+            r"a\s+criterio|apos|quando|se|caso|amanha|previst[ao]|programad[ao]"
+            r")\b",
+            after,
+        ):
+            continue
+        if re.search(
+            r"\b(?:"
+            r"antes\s+(?:da|de)|apos\s+a|na|para|pos|"
+            r"(?:relatorio|orientacoes)\s+de|de\s+acordo\s+com"
+            r")\s*$",
+            before,
+        ):
+            continue
+        if re.search(r"\b(?:avaliar|reavaliar)\b.{0,55}$", before):
+            continue
+        return True
+    return False
 
 
 def extract_completed_discharge(text: str) -> tuple[str, str] | None:
@@ -274,6 +351,76 @@ def parse_census_discharge(value: Any) -> tuple[str, str] | None:
             continue
         return parsed.strftime("%d/%m/%Y"), parsed.strftime("%H:%M")
     return None
+
+
+def resolve_discharge(
+    evolution_text: str,
+    census_value: Any = None,
+    evolution_date: Any = None,
+    seed: str = "",
+) -> tuple[str, str, str] | None:
+    """Aplica a regra única de alta usada pelo Excel, Novo Dia e lançamento."""
+    death = extract_completed_death(evolution_text)
+    if death:
+        discharge_date, hour = death
+        return discharge_date, hour, "Óbito"
+
+    completed = extract_completed_discharge(evolution_text)
+    if completed:
+        discharge_date, hour = completed
+        return discharge_date, hour, "Alta melhorada"
+
+    census = parse_census_discharge(census_value)
+    if census:
+        discharge_date, hour = census
+        return discharge_date, hour, "Alta melhorada"
+
+    return resolve_evolution_discharge(
+        evolution_text,
+        evolution_date=evolution_date,
+        seed=seed,
+    )
+
+
+def resolve_evolution_discharge(
+    evolution_text: str,
+    evolution_date: Any = None,
+    seed: str = "",
+) -> tuple[str, str, str] | None:
+    """Resolve apenas altas comprovadas no final da evolução."""
+    death = extract_completed_death(evolution_text)
+    if death:
+        discharge_date, hour = death
+        return discharge_date, hour, "Óbito"
+
+    completed = extract_completed_discharge(evolution_text)
+    if completed:
+        discharge_date, hour = completed
+        return discharge_date, hour, "Alta melhorada"
+
+    incomplete = extract_incomplete_discharge(evolution_text)
+    if incomplete:
+        discharge_date, _invalid_hour = incomplete
+        hour = technical_discharge_time(f"{seed}|{discharge_date}")
+        return discharge_date, hour, "Alta melhorada"
+
+    if has_effective_discharge_at_end(evolution_text):
+        discharge_date = parse_evolution_date(evolution_date)
+        if discharge_date:
+            hour = technical_discharge_time(f"{seed}|{discharge_date}")
+            return discharge_date, hour, "Alta melhorada"
+    return None
+
+
+def discharge_as_datetime(discharge: tuple[str, str, str] | None) -> dt.datetime | None:
+    """Converte o desfecho resolvido para uma célula real de data/hora do Excel."""
+    if not discharge:
+        return None
+    discharge_date, hour, _outcome = discharge
+    try:
+        return dt.datetime.strptime(f"{discharge_date} {hour}", "%d/%m/%Y %H:%M")
+    except ValueError:
+        return None
 
 
 def value_to_text(value: Any) -> str:
@@ -422,6 +569,7 @@ def read_clinical(path: Path) -> tuple[dict[str, list[ClinicalPatient]], dict[st
     dias_col = find_column(headers, "Dias internado", "Dias internados")
     id_col = find_column(headers, "ID internação", "ID internacao")
     census_discharge_col = find_column(headers, "Alta (data e hora)")
+    evolution_date_col = find_column(headers, "Data da evolução", "Data da evolucao")
 
     meta = read_field_meta(wb)
     options = read_options(wb)
@@ -444,8 +592,9 @@ def read_clinical(path: Path) -> tuple[dict[str, list[ClinicalPatient]], dict[st
             for header, col in headers.items()
             if header in field_headers
         }
-        evolution_text = value_to_text(values.get("evolucao")).lower()
-        if any(term in evolution_text for term in ("dialise pausada", "diálise pausada", "pausado dialise", "pausada dialise")):
+        evolution_text = value_to_text(values.get("evolucao"))
+        normalized_evolution = evolution_text.lower()
+        if any(term in normalized_evolution for term in ("dialise pausada", "diálise pausada", "pausado dialise", "pausada dialise")):
             therapies = value_to_text(values.get("Conduta Clínica - Terapias em andamento * (cond.)"))
             active_therapies = [
                 item.strip()
@@ -576,38 +725,26 @@ def read_clinical(path: Path) -> tuple[dict[str, list[ClinicalPatient]], dict[st
             if is_blank(values.get(field)):
                 values[field] = default
 
-        death = extract_completed_death(evolution_text)
-        discharge = extract_completed_discharge(evolution_text)
-        incomplete_discharge = extract_incomplete_discharge(evolution_text)
-        census_discharge = (
-            parse_census_discharge(ws.cell(row, census_discharge_col).value)
-            if census_discharge_col
-            else None
+        discharge = resolve_discharge(
+            evolution_text,
+            census_value=(
+                ws.cell(row, census_discharge_col).value
+                if census_discharge_col
+                else None
+            ),
+            evolution_date=(
+                ws.cell(row, evolution_date_col).value
+                if evolution_date_col
+                else None
+            ),
+            seed=senha,
         )
-        if death:
-            discharge_date, hour = death
+        if discharge:
+            discharge_date, hour, outcome = discharge
             values["Parecer do Auditor - Paciente permanece internado? *"] = "Não"
-            values["Parecer do Auditor - Selecione o desfecho assistencial * (cond.)"] = "Óbito"
+            values["Parecer do Auditor - Selecione o desfecho assistencial * (cond.)"] = outcome
             values["Parecer do Auditor - Data do desfecho * (cond.)"] = discharge_date
             values["Parecer do Auditor - Hora do desfecho * (cond.)"] = hour
-        elif discharge:
-            discharge_date, hour = discharge
-            values["Parecer do Auditor - Paciente permanece internado? *"] = "Não"
-            values["Parecer do Auditor - Selecione o desfecho assistencial * (cond.)"] = "Alta melhorada"
-            values["Parecer do Auditor - Data do desfecho * (cond.)"] = discharge_date
-            values["Parecer do Auditor - Hora do desfecho * (cond.)"] = hour
-        elif census_discharge:
-            discharge_date, hour = census_discharge
-            values["Parecer do Auditor - Paciente permanece internado? *"] = "Não"
-            values["Parecer do Auditor - Selecione o desfecho assistencial * (cond.)"] = "Alta melhorada"
-            values["Parecer do Auditor - Data do desfecho * (cond.)"] = discharge_date
-            values["Parecer do Auditor - Hora do desfecho * (cond.)"] = hour
-        elif incomplete_discharge:
-            discharge_date, _invalid_hour = incomplete_discharge
-            values["Parecer do Auditor - Paciente permanece internado? *"] = "Não"
-            values["Parecer do Auditor - Selecione o desfecho assistencial * (cond.)"] = "Alta melhorada"
-            values["Parecer do Auditor - Data do desfecho * (cond.)"] = discharge_date
-            values["Parecer do Auditor - Hora do desfecho * (cond.)"] = TECHNICAL_DISCHARGE_TIME
         elif value_to_text(values.get("Parecer do Auditor - Paciente permanece internado? *")).lower().startswith("n"):
             required_discharge = [
                 "Parecer do Auditor - Selecione o desfecho assistencial * (cond.)",
@@ -794,7 +931,20 @@ class SalusExecutor:
                 "Demais páginas preenchidas; falta apenas definir o CID antes da confirmação."
             )
         if not result.get("confirmEnabled"):
-            raise RuntimeError("Tela HTML preenchida, mas Confirmar evolucao permaneceu desabilitado.")
+            incomplete = [
+                str(page).strip()
+                for page in result.get("incompleteSteps", [])
+                if str(page).strip()
+            ]
+            detail = (
+                " Páginas sem check verde: " + ", ".join(incomplete) + "."
+                if incomplete
+                else ""
+            )
+            raise RuntimeError(
+                "Tela HTML preenchida, mas Confirmar evolucao permaneceu desabilitado."
+                + detail
+            )
         for field in fields:
             if field.status == "PENDENTE":
                 field.status = "OK"

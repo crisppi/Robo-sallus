@@ -15,8 +15,15 @@ from copy import copy
 from pathlib import Path
 
 from openpyxl import load_workbook
-from openpyxl.styles import PatternFill
+from openpyxl.styles import Font, PatternFill
 
+from etapa2_lancar_evolucao_salus import (
+    EVOLUTION_DISCHARGE_FILL,
+    EVOLUTION_DISCHARGE_FONT,
+    discharge_as_datetime,
+    parse_census_discharge,
+    resolve_evolution_discharge,
+)
 from gerar_lista_pacientes import fetch_patients, pick, save_excel
 from preencher_evolucoes_excel import extract
 from salus_cdp import SalusCdpError
@@ -83,15 +90,25 @@ def generate_clinical_base(
     previous_rows: dict[tuple[str, str], dict[str, object]] = {}
     senha_col = headers.get("Senha")
     id_col = headers.get("ID internação")
+    previous_high_col = headers.get("Alta (data e hora)")
     if senha_col and id_col:
         for row_number in range(2, sheet.max_row + 1):
             senha = str(sheet.cell(row_number, senha_col).value or "").strip()
             admission_id = str(sheet.cell(row_number, id_col).value or "").strip()
             if senha:
-                previous_rows[(senha, admission_id)] = {
+                previous_values = {
                     header: sheet.cell(row_number, column).value
                     for header, column in headers.items()
                 }
+                previous_high_color = (
+                    str(sheet.cell(row_number, previous_high_col).fill.fgColor.rgb or "")
+                    if previous_high_col
+                    else ""
+                )
+                previous_values["__alta_origem_evolucao__"] = (
+                    previous_high_color.upper().endswith(EVOLUTION_DISCHARGE_FILL)
+                )
+                previous_rows[(senha, admission_id)] = previous_values
 
     row_style = [
         (
@@ -136,6 +153,9 @@ def generate_clinical_base(
         senha = str(values[2] or "").strip()
         admission_id = str(values[4] or "").strip()
         previous = previous_rows.get((senha, admission_id), {})
+        previous_high_from_evolution = bool(
+            previous.get("__alta_origem_evolucao__")
+        )
         # Dados estáveis da mesma internação podem ser reaproveitados. Os
         # blocos de exame, conduta, UTI, auditor e status são sempre diários.
         reusable_headers = {
@@ -148,12 +168,31 @@ def generate_clinical_base(
             "Dados da Internação - CID de internação *",
             "Dados da Internação - CID ajustado *",
             "Dados da Internação - Comorbidades *",
+            "Alta (data e hora)",
         }
         for header in reusable_headers:
             column = headers.get(header)
             value = previous.get(header)
             if column and value not in (None, ""):
-                sheet.cell(row_number, column).value = value
+                cell = sheet.cell(row_number, column)
+                cell.value = value
+                if header == "Alta (data e hora)":
+                    if previous_high_from_evolution:
+                        cell.number_format = "dd/mm/yyyy hh:mm"
+                        cell.fill = PatternFill(
+                            "solid", fgColor=EVOLUTION_DISCHARGE_FILL
+                        )
+                        cell.font = Font(
+                            color=EVOLUTION_DISCHARGE_FONT, bold=True
+                        )
+                    elif parse_census_discharge(value):
+                        cell.number_format = "dd/mm/yyyy hh:mm"
+                        cell.fill = PatternFill("solid", fgColor="FFC7CE")
+                        cell.font = Font(color="9C0006", bold=True)
+                    elif str(value).strip().casefold() == "internado":
+                        cell.number_format = "General"
+                        cell.fill = PatternFill("solid", fgColor="C6EFCE")
+                        cell.font = Font(color="006100", bold=True)
 
         evolution_cell = sheet.cell(row_number, headers["evolucao"])
         previous_evolution = previous.get("evolucao")
@@ -166,8 +205,34 @@ def generate_clinical_base(
             if evolution_date_column and evolution_date:
                 sheet.cell(row_number, evolution_date_column).value = evolution_date.strftime("%d/%m/%Y")
 
-            inferred_values = extract(str(previous_evolution), values[3])
-            row_writes = 0
+            inferred_values = extract(
+                str(previous_evolution),
+                values[3],
+                census_discharge=previous.get("Alta (data e hora)"),
+                evolution_date=evolution_date,
+                seed=senha,
+            )
+            evolution_discharge = resolve_evolution_discharge(
+                str(previous_evolution),
+                evolution_date=evolution_date,
+                seed=senha,
+            )
+            evolution_datetime = discharge_as_datetime(evolution_discharge)
+            high_column = headers.get("Alta (data e hora)")
+            evolution_high_written = False
+            if (
+                high_column
+                and evolution_datetime
+                and not previous_high_from_evolution
+                and parse_census_discharge(previous.get("Alta (data e hora)")) is None
+            ):
+                high_cell = sheet.cell(row_number, high_column)
+                high_cell.value = evolution_datetime
+                high_cell.number_format = "dd/mm/yyyy hh:mm"
+                high_cell.fill = PatternFill("solid", fgColor=EVOLUTION_DISCHARGE_FILL)
+                high_cell.font = Font(color=EVOLUTION_DISCHARGE_FONT, bold=True)
+                evolution_high_written = True
+            row_writes = 1 if evolution_high_written else 0
             for header, inferred_value in inferred_values.items():
                 column = headers.get(header)
                 if not column or inferred_value in (None, ""):
@@ -182,6 +247,16 @@ def generate_clinical_base(
         else:
             evolution_cell.value = None
             evolution_cell.fill = PatternFill("solid", fgColor="FFC7CE")
+
+    # A base anterior pode ter mais pacientes do que a fila do novo dia.
+    # Remover as linhas excedentes evita que o Excel mantenha linhas vazias
+    # aparentando pacientes sem evolução.
+    first_extra_row = len(patients) + 2
+    if sheet.max_row >= first_extra_row:
+        sheet.delete_rows(
+            first_extra_row,
+            sheet.max_row - first_extra_row + 1,
+        )
 
     sheet.auto_filter.ref = f"A1:{sheet.cell(1, sheet.max_column).column_letter}{len(patients) + 1}"
     output.parent.mkdir(parents=True, exist_ok=True)
