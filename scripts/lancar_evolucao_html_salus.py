@@ -2085,7 +2085,25 @@ def run_html_fill(
         summary["missingCid"] = missing_cid
         return summary
 
+    original_status = value_to_text(
+        clinical_patient.values.get("Lançamento Salus - Status")
+    ).strip().upper()
+    original_message = value_to_text(
+        clinical_patient.values.get("Lançamento Salus - Mensagem")
+    ).strip().upper()
+    retry_as_clinical = (
+        original_status == "ERRO"
+        and "DADOS CIRÚRGICOS" in original_message
+    )
+
     open_sec("100001")
+    if retry_as_clinical:
+        click_radio_by_question(
+            "100001",
+            "Tipo da internação",
+            "Clínica",
+        )
+        all_logs.append("Tipo da internação alterado para Clínica")
     set_input("100001", "#admission-date", date_html(value("Dados da Internação - Data da internação *")))
     click_radio(
         "100001",
@@ -2130,12 +2148,6 @@ def run_html_fill(
     set_duration_combo("100001", value("Dados da Internação - Tempo de existência da doença *"), value_or("Dados da Internação - Nomenclatura do tempo de existência da doença *", "Dias"))
     next_sec("100001", allow_incomplete=missing_cid)
 
-    original_status = value_to_text(
-        clinical_patient.values.get("Lançamento Salus - Status")
-    ).strip().upper()
-    original_message = value_to_text(
-        clinical_patient.values.get("Lançamento Salus - Mensagem")
-    ).strip().upper()
     resume_cid_only = original_status == "AGUARDANDO_CID" or (
         original_status == "AGUARDANDO" and original_message.startswith("CID ")
     )
@@ -2158,6 +2170,22 @@ def run_html_fill(
             url_contains=f"/avaliacao-internacao/{clinical_patient.id_internacao}/",
         )
     )
+    surgery_yn = value_or(
+        "Conduta Clínica - Realizado procedimento cirúrgico? *", "Não"
+    )
+    force_clinical = (
+        original_status == "ERRO"
+        and "DADOS CIRÚRGICOS" in original_message
+    )
+    if force_clinical:
+        # Quando não há informação cirúrgica utilizável, a etapa exibida pelo
+        # Salus não deve bloquear a evolução clínica. A conduta clínica abaixo
+        # registra explicitamente que não houve procedimento cirúrgico.
+        has_surgical_step = False
+        surgery_yn = "Não"
+        all_logs.append(
+            "Retentativa como paciente clínico: etapa Dados Cirúrgicos ignorada"
+        )
     if has_surgical_step:
         open_sec("200007")
         evolution_text = value("evolucao")

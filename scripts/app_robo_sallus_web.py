@@ -363,6 +363,15 @@ def run_etapa2_worker(
             if statuses & finalized_statuses:
                 attempted_passwords.add(senha)
 
+            # Registros pausados exigem uma ação específica antes de continuar
+            # (por exemplo, informar o CID). Não devem entrar por acidente em um
+            # lote geral. Ainda podem ser retomados quando a senha é solicitada
+            # explicitamente.
+            if not only_password and statuses & {
+                "AGUARDANDO", "AGUARDANDO_CID", "PRE_LANCADO"
+            }:
+                attempted_passwords.add(senha)
+
         if not retry_errors:
             attempted_passwords.update(error_passwords)
 

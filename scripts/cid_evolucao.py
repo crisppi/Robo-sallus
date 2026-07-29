@@ -39,6 +39,23 @@ def infer_cid_suggestion(text: str) -> tuple[str, str]:
         return "S09.9", "traumatismo craniano sem lesão mais específica descrita"
 
     rules: tuple[tuple[tuple[str, ...], str, str], ...] = (
+        (("sindrome de guillain-barre", "sindrome de guillain barre", "polirradiculoneurite aguda"), "G61.0", "síndrome de Guillain-Barré"),
+        (("retirada de corpo estranho subcutaneo", "corpo estranho subcutaneo"), "M79.5", "corpo estranho residual em tecido mole"),
+        (("revisao total de ptq", "revisao acetabular de ptq", "luxacao de acetabulo"), "T84.0", "complicação mecânica de prótese articular interna"),
+        (("hsa traumatica", "hemorragia subaracnoidea traumatica"), "S06.6", "hemorragia subaracnóidea traumática"),
+        (("dor a mobilizacao da coluna cervical", "bloqueios da coluna cervical"), "M54.2", "cervicalgia"),
+        (("cancer de mama metastatico", "neoplasia de mama metastatica"), "C50.9", "neoplasia maligna da mama"),
+        (("pneumonia",), "J18.9", "pneumonia não especificada"),
+        (("sars-cov-2", "sars cov 2", "covid-19", "covid 19"), "U07.1", "COVID-19"),
+        (("dor cervical", "cervicalgia"), "M54.2", "cervicalgia"),
+        (("hemiparesia esquerda", "deficit motor a esquerda", "déficit motor à esquerda"), "I63.9", "infarto cerebral com déficit focal"),
+        (("adenocarcinoma de reto", "neoplasia de reto"), "C20", "neoplasia maligna do reto"),
+        (("ic descompensada", "insuficiencia cardiaca descompensada"), "I50.9", "insuficiência cardíaca"),
+        (("colecistite aguda", "colecistite agua"), "K81.0", "colecistite aguda"),
+        (("vestibulopatia periferica", "labirintite"), "H81.9", "transtorno da função vestibular"),
+        (("infeccao urinaria", "infecção urinária", "itu de repeticao", "itu de repetição"), "N39.0", "infecção do trato urinário"),
+        (("choque septico", "choque séptico"), "R57.2", "choque séptico"),
+        (("anemia", "hb 8,6", "hb 8.6"), "D64.9", "anemia não especificada"),
         (("fratura-luxacao traumatica", "fratura do umero proximal"), "S42.2", "fratura da extremidade superior do úmero"),
         (("fratura do extremo distal do radio", "fratura distal do radio"), "S52.5", "fratura da extremidade distal do rádio"),
         (("fratura do sacro", "fratura sacral"), "S32.1", "fratura do sacro"),

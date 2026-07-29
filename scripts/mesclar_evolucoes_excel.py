@@ -11,7 +11,8 @@ from __future__ import annotations
 import argparse
 import shutil
 import unicodedata
-from datetime import datetime
+from copy import copy
+from datetime import date, datetime
 from pathlib import Path
 
 from openpyxl import load_workbook
@@ -48,6 +49,21 @@ def sheet_for(workbook):
     return workbook["Preenchimento"] if "Preenchimento" in workbook.sheetnames else workbook.active
 
 
+def is_dated_discharge(value: object) -> bool:
+    if isinstance(value, (datetime, date)):
+        return True
+    text = str(value or "").strip()
+    if not text:
+        return False
+    for pattern in ("%d/%m/%Y %H:%M", "%d/%m/%Y", "%Y-%m-%d %H:%M:%S"):
+        try:
+            datetime.strptime(text, pattern)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
 def row_key(sheet, row: int, senha_col: int | None, nome_col: int | None) -> tuple[str, str] | None:
     if senha_col:
         senha = normalize(sheet.cell(row, senha_col).value)
@@ -69,6 +85,14 @@ def main() -> int:
     parser.add_argument(
         "--data-evolucao",
         help="Data padrao (DD/MM/AAAA) para evolucoes mescladas cuja data esteja vazia.",
+    )
+    parser.add_argument(
+        "--mesclar-altas",
+        action="store_true",
+        help=(
+            "Acrescenta altas datadas da origem quando o destino ainda nao possui "
+            "alta datada; altas ja confirmadas no destino sao preservadas."
+        ),
     )
     args = parser.parse_args()
 
@@ -170,6 +194,27 @@ def main() -> int:
             if source_value not in (None, "") and target_value in (None, ""):
                 target_sheet.cell(target_row, target_col).value = source_value
 
+    merged_discharges = 0
+    preserved_discharges = 0
+    if args.mesclar_altas:
+        source_discharge_col = find_column(source_headers, "Alta (data e hora)")
+        target_discharge_col = find_column(target_headers, "Alta (data e hora)")
+        if not source_discharge_col or not target_discharge_col:
+            raise RuntimeError("A coluna 'Alta (data e hora)' nao foi encontrada nas duas bases.")
+        for source_row, target_row, _key in matched_rows:
+            source_cell = source_sheet.cell(source_row, source_discharge_col)
+            target_cell = target_sheet.cell(target_row, target_discharge_col)
+            if not is_dated_discharge(source_cell.value):
+                continue
+            if is_dated_discharge(target_cell.value):
+                preserved_discharges += 1
+                continue
+            target_cell.value = source_cell.value
+            target_cell.number_format = source_cell.number_format or "dd/mm/yyyy hh:mm"
+            target_cell.fill = copy(source_cell.fill)
+            target_cell.font = copy(source_cell.font)
+            merged_discharges += 1
+
     dated_rows = 0
     styled_rows = 0
     target_date_col = find_column(target_headers, "Data da evolução")
@@ -191,6 +236,8 @@ def main() -> int:
     target_workbook.save(args.destino)
     print(f"Arquivo atualizado: {args.destino}")
     print(f"Evolucoes acrescentadas: {len(additions)}")
+    print(f"Altas datadas acrescentadas: {merged_discharges}")
+    print(f"Altas datadas ja existentes e preservadas: {preserved_discharges}")
     print(f"Datas de evolucao preenchidas: {dated_rows}")
     print(f"Evolucoes sinalizadas em verde: {styled_rows}")
     return 0
