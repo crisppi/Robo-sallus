@@ -126,6 +126,7 @@ def infer_cid_suggestion(text: str) -> tuple[str, str]:
         (("colangite",), "K83.0", "colangite"),
         (("pancreatite cronica agudizada", "pancreatite aguda", "pancreatite leve"), "K85.9", "pancreatite aguda"),
         (("migracao de calculo", "coledocolitiase"), "K80.5", "cálculo de via biliar"),
+        (("aumento das enzimas hepaticas", "elevacao de enzimas hepaticas", "transaminases elevadas"), "R74.0", "elevação de transaminases/enzimas hepáticas"),
         (("fistula liquorica", "hipotensao liquorica"), "G96.0", "fístula liquórica"),
         (("abstinencia alcoolica",), "F10.3", "abstinência alcoólica"),
         (("linfonodomegalias", "esplenomegalia sintomatica"), "R59.1", "linfonodomegalia generalizada"),
