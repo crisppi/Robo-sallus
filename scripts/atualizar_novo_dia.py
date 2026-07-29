@@ -194,6 +194,25 @@ def generate_clinical_base(
                         cell.fill = PatternFill("solid", fgColor="C6EFCE")
                         cell.font = Font(color="006100", bold=True)
 
+        # A alta do censo vale mesmo quando a evolução ainda está ausente.
+        # Como o bloco do auditor é diário e foi limpo acima, grave também os
+        # campos de desfecho para que a planilha já fique pronta para o Salus.
+        census_discharge = parse_census_discharge(
+            previous.get("Alta (data e hora)")
+        )
+        if census_discharge:
+            discharge_date, discharge_hour = census_discharge
+            census_discharge_values = {
+                "Parecer do Auditor - Paciente permanece internado? *": "Não",
+                "Parecer do Auditor - Selecione o desfecho assistencial * (cond.)": "Alta melhorada",
+                "Parecer do Auditor - Data do desfecho * (cond.)": discharge_date,
+                "Parecer do Auditor - Hora do desfecho * (cond.)": discharge_hour,
+            }
+            for header, value in census_discharge_values.items():
+                column = headers.get(header)
+                if column:
+                    sheet.cell(row_number, column).value = value
+
         evolution_cell = sheet.cell(row_number, headers["evolucao"])
         previous_evolution = previous.get("evolucao")
         if previous_evolution not in (None, "") and str(previous_evolution).strip():
