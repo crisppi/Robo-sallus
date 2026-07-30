@@ -33,6 +33,7 @@ ROOT = Path(__file__).resolve().parents[1]
 EXPORTS = ROOT / "exports"
 ARCHIVE = EXPORTS / "arquivo"
 DEFAULT_TEMPLATE = ROOT / "templates" / "data_base_lancamento_modelo.xlsx"
+INPATIENT_NAME_FILL = "E4DFEC"
 
 
 def parse_date(value: str) -> dt.date:
@@ -90,7 +91,9 @@ def generate_clinical_base(
     previous_rows: dict[tuple[str, str], dict[str, object]] = {}
     senha_col = headers.get("Senha")
     id_col = headers.get("ID internação")
+    name_col = headers.get("Nome paciente") or headers.get("Nome")
     previous_high_col = headers.get("Alta (data e hora)")
+    neutral_name_style = None
     if senha_col and id_col:
         for row_number in range(2, sheet.max_row + 1):
             senha = str(sheet.cell(row_number, senha_col).value or "").strip()
@@ -108,6 +111,23 @@ def generate_clinical_base(
                 previous_values["__alta_origem_evolucao__"] = (
                     previous_high_color.upper().endswith(EVOLUTION_DISCHARGE_FILL)
                 )
+                if name_col:
+                    name_cell = sheet.cell(row_number, name_col)
+                    name_color = str(name_cell.fill.fgColor.rgb or "")
+                    name_is_lilac = name_color.upper().endswith(
+                        INPATIENT_NAME_FILL
+                    )
+                    previous_values["__nome_lilas__"] = name_is_lilac
+                    previous_values["__nome_estilo__"] = (
+                        copy(name_cell.font),
+                        copy(name_cell.fill),
+                        copy(name_cell.border),
+                        copy(name_cell.alignment),
+                        name_cell.number_format,
+                        copy(name_cell.protection),
+                    )
+                    if neutral_name_style is None and not name_is_lilac:
+                        neutral_name_style = previous_values["__nome_estilo__"]
                 previous_rows[(senha, admission_id)] = previous_values
 
     row_style = [
@@ -156,6 +176,35 @@ def generate_clinical_base(
         previous_high_from_evolution = bool(
             previous.get("__alta_origem_evolucao__")
         )
+        if name_col and neutral_name_style:
+            name_cell = sheet.cell(row_number, name_col)
+            name_cell.font = copy(neutral_name_style[0])
+            name_cell.fill = copy(neutral_name_style[1])
+            name_cell.border = copy(neutral_name_style[2])
+            name_cell.alignment = copy(neutral_name_style[3])
+            name_cell.number_format = neutral_name_style[4]
+            name_cell.protection = copy(neutral_name_style[5])
+        if name_col and previous.get("__nome_lilas__"):
+            previous_name_style = previous.get("__nome_estilo__")
+            if previous_name_style:
+                name_cell = sheet.cell(row_number, name_col)
+                name_cell.font = copy(previous_name_style[0])
+                name_cell.fill = copy(previous_name_style[1])
+                name_cell.border = copy(previous_name_style[2])
+                name_cell.alignment = copy(previous_name_style[3])
+                name_cell.number_format = previous_name_style[4]
+                name_cell.protection = copy(previous_name_style[5])
+
+        # A coluna de alta é individual. Nunca reaproveitar a cor de uma linha
+        # como estilo padrão para pacientes sem alta ou sem marcação.
+        high_column = headers.get("Alta (data e hora)")
+        if high_column:
+            high_cell = sheet.cell(row_number, high_column)
+            high_cell.fill = PatternFill()
+            if neutral_name_style:
+                high_cell.font = copy(neutral_name_style[0])
+            high_cell.number_format = "General"
+
         # Dados estáveis da mesma internação podem ser reaproveitados. Os
         # blocos de exame, conduta, UTI, auditor e status são sempre diários.
         reusable_headers = {

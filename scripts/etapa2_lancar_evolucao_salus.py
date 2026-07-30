@@ -53,6 +53,14 @@ class AwaitingCidError(RuntimeError):
 
 class AwaitingDischargeError(RuntimeError):
     pass
+
+
+class SalusAuthenticationError(RuntimeError):
+    """Interrompe o lote inteiro quando a sessão do Salus não está autenticada."""
+
+    pass
+
+
 MULTIPLE_TYPES = {"LISTA_MULTIPLA"}
 MULTIPLE_CONTROLS = {"CHECKBOX_MULTI", "MULTISELECT"}
 YES_VALUES = {"sim", "s", "yes", "y", "true", "1"}
@@ -902,6 +910,14 @@ class SalusExecutor:
 
     def lancar(self, queue_patient: QueuePatient, clinical_patient: ClinicalPatient, fields: list[PreparedField]) -> list[PreparedField]:
         from lancar_evolucao_html_salus import run_html_fill
+        from salus_cdp import find_salus_tab
+
+        salus_tab = find_salus_tab()
+        if "/salus/auth/" in salus_tab.url:
+            raise SalusAuthenticationError(
+                "Sessão do Salus expirada ou não autenticada. "
+                "Faça login na aba do Salus antes de reiniciar o lote."
+            )
 
         remains_admitted = value_to_text(
             clinical_patient.values.get("Parecer do Auditor - Paciente permanece internado? *")
@@ -1121,6 +1137,10 @@ def process_patients(
                 if progress_callback:
                     progress_callback("fim", queue_patient, result)
                 continue
+            except SalusAuthenticationError:
+                # Falha global da sessão: não marque o paciente como erro e
+                # não percorra o restante da fila com o mesmo problema.
+                raise
             except Exception as exc:
                 result = PatientResult(
                     senha=queue_patient.senha,

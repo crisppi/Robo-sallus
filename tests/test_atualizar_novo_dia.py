@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+from copy import copy
 from datetime import date, datetime
 from pathlib import Path
 
@@ -311,6 +312,82 @@ class AtualizarNovoDiaTests(unittest.TestCase):
             ).value,
             "10:12",
         )
+
+    def test_lilac_name_is_preserved_only_for_same_admission(self):
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "Preenchimento"
+        sheet.append(
+            [
+                "Nome paciente",
+                "Iniciais",
+                "Senha",
+                "Dias internado",
+                "ID internação",
+                "Alta (data e hora)",
+                "evolucao",
+            ]
+        )
+        sheet.append(["Paciente Lilás", "PL", "LILAS01", 3, 501, None, None])
+        sheet.append(["Paciente Neutro", "PN", "NEUTRO1", 2, 502, None, None])
+        sheet.cell(2, 1).fill = PatternFill("solid", fgColor="E4DFEC")
+        lilac_font = copy(sheet.cell(2, 1).font)
+        lilac_font.color = "7030A0"
+        lilac_font.bold = True
+        sheet.cell(2, 1).font = lilac_font
+        patients = [
+            {
+                "nomeCompleto": "Paciente Lilás",
+                "nomeIniciais": "PL",
+                "senha": "LILAS01",
+                "diasInternados": 4,
+                "idInternacao": 501,
+            },
+            {
+                "nomeCompleto": "Paciente Neutro",
+                "nomeIniciais": "PN",
+                "senha": "NEUTRO1",
+                "diasInternados": 3,
+                "idInternacao": 502,
+            },
+            {
+                "nomeCompleto": "Paciente Novo",
+                "nomeIniciais": "PNO",
+                "senha": "NOVO001",
+                "diasInternados": 0,
+                "idInternacao": 503,
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory) / "base.xlsx"
+            generate_clinical_base(
+                patients,
+                Path("modelo_nao_usado.xlsx"),
+                output,
+                previous_workbook=workbook,
+                evolution_date=date(2026, 7, 30),
+            )
+            result = load_workbook(output)
+
+        result_sheet = result["Preenchimento"]
+        columns = {str(cell.value): cell.column for cell in result_sheet[1] if cell.value}
+        name_column = columns["Nome paciente"]
+        high_column = columns["Alta (data e hora)"]
+        self.assertTrue(
+            result_sheet.cell(2, name_column).fill.fgColor.rgb.endswith("E4DFEC")
+        )
+        self.assertFalse(
+            str(result_sheet.cell(3, name_column).fill.fgColor.rgb or "").endswith(
+                "E4DFEC"
+            )
+        )
+        self.assertFalse(
+            str(result_sheet.cell(4, name_column).fill.fgColor.rgb or "").endswith(
+                "E4DFEC"
+            )
+        )
+        self.assertIsNone(result_sheet.cell(4, high_column).fill.fill_type)
 
 
 if __name__ == "__main__":
