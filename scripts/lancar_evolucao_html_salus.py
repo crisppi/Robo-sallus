@@ -1371,6 +1371,26 @@ def run_html_fill(
         """
         all_logs.append(str(eval_sec(secao, js)))
 
+    def click_radio_value(secao: str, name: str, val: str) -> None:
+        if not val:
+            return
+        js = f"""
+        (() => {{
+          const norm = (value) => String(value ?? '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toLowerCase();
+          const wanted = norm({json.dumps(val)});
+          const items = [...document.querySelectorAll(`input[name="${{CSS.escape({json.dumps(name)})}}"]`)];
+          const target = items.find(input => norm(input.value) === wanted);
+          if (!target) return `opcao por valor nao encontrada: {name}`;
+          target.scrollIntoView({{block: 'center'}});
+          target.click();
+          for (const eventName of ['input', 'change', 'blur']) {{
+            target.dispatchEvent(new Event(eventName, {{bubbles: true}}));
+          }}
+          return `opcao por valor: {name}=${val}`;
+        }})()
+        """
+        all_logs.append(str(eval_sec(secao, js)))
+
     def click_first_radio(secao: str, name: str) -> None:
         """Seleciona a primeira opção visível de um grupo condicional obrigatório."""
         js = f"""
@@ -1586,6 +1606,7 @@ def run_html_fill(
           }};
           const isComplaint = {json.dumps(selector)} === '#admission-complaint';
           const isAdjustedCid = {json.dumps(selector)} === '#admission-adjusted-cid';
+          const isTuss = {json.dumps(selector)}.includes('padrao-tiss-search-multi-select');
           const isSearchCatalog = ['#admission-complaint', '#admission-cid', '#admission-comorbidities', '#admission-adjusted-cid'].includes({json.dumps(selector)});
           const selectionNeedles = (part) => {{
             const dash = part.indexOf(' - ');
@@ -1613,6 +1634,20 @@ def run_html_fill(
           }}
           if (!isComplaint && text.includes('selecionado') && !isAdjustedCid) {{
             return `multiselect ja preenchido: {selector}`;
+          }}
+          if (isTuss && hasRealValue(text) && !desiredAlreadySelected) {{
+            const clear = trigger.querySelector('[aria-label*="Limpar"], [title*="Limpar"]')
+              || [...trigger.querySelectorAll('span, button')].find(el =>
+                norm(el.innerText) === 'x'
+                || norm(el.innerText) === '×'
+                || norm(el.getAttribute('aria-label') || el.getAttribute('title') || '').includes('limpar')
+              );
+            if (clear) {{
+              clear.dispatchEvent(new MouseEvent('mousedown', {{bubbles: true}}));
+              clear.click();
+              await sleep(700);
+              text = norm(trigger.innerText);
+            }}
           }}
           if (isAdjustedCid && hasRealValue(text)) {{
             const clear = trigger.querySelector('[aria-label*="Limpar"], [title*="Limpar"]')
@@ -2173,19 +2208,28 @@ def run_html_fill(
     surgery_yn = value_or(
         "Conduta Clínica - Realizado procedimento cirúrgico? *", "Não"
     )
+    has_explicit_surgical_info = bool(
+        value("Conduta Clínica - Realizado procedimento cirúrgico? *").strip()
+        or value("Conduta Clínica - TUSS + Nome do Procedimento * (cond.)").strip()
+    )
     force_clinical = (
         original_status == "ERRO"
         and "DADOS CIRÚRGICOS" in original_message
+        and not has_explicit_surgical_info
     )
     if force_clinical:
-        # Quando não há informação cirúrgica utilizável, a etapa exibida pelo
-        # Salus não deve bloquear a evolução clínica. A conduta clínica abaixo
-        # registra explicitamente que não houve procedimento cirúrgico.
-        has_surgical_step = False
+        # Quando a tentativa anterior travou em Dados Cirúrgicos, a página
+        # ainda precisa ficar verde no Salus. Abrir a seção e marcar "Não"
+        # evita que o resumo permaneça bloqueado por uma etapa não visitada.
         surgery_yn = "Não"
         all_logs.append(
-            "Retentativa como paciente clínico: etapa Dados Cirúrgicos ignorada"
+            "Retentativa como paciente clínico: Dados Cirúrgicos marcado como Não"
         )
+        if has_surgical_step:
+            open_sec("200007")
+            click_radio("200007", "clinical-conduct-surgical-yn", "Não")
+            next_sec("200007")
+            has_surgical_step = False
     if has_surgical_step:
         open_sec("200007")
         evolution_text = value("evolucao")
@@ -2210,6 +2254,11 @@ def run_html_fill(
             else value_or("Conduta Clínica - Realizado procedimento cirúrgico? *", "Não")
         )
         click_radio("200007", "clinical-conduct-surgical-yn", surgery_yn)
+        click_radio_value(
+            "200007",
+            "clinical-conduct-surgical-yn",
+            "SIM" if surgery_yn.lower().startswith("s") else "NAO",
+        )
         if surgery_yn.lower().startswith("s"):
             choose_multi(
                 "200007",
