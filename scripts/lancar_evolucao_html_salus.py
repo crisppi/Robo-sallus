@@ -871,10 +871,26 @@ def run_html_fill(
                 r"\bureterolitotripsia\b|\bult flex\b",
                 "Ureterorrenolitotripsia flexível a laser unilateral",
             ),
+            (
+                r"\bretirad[ao] (?:do |de )?cateter duplo j\b|"
+                r"\bretirad[ao] (?:do |de )?duplo j\b",
+                "Retirada de cateter duplo J",
+            ),
             (r"\bherniorrafia\b", "Herniorrafia"),
             (r"\bhemorroidectomia\b", "Hemorroidectomia"),
             (r"\bdrenagem (?:de )?(?:abscesso|colecao)\b", "Drenagem de abscesso"),
-            (r"\bartroplastia\b", "Artroplastia"),
+            (
+                r"\blimpeza cirurgica\b|\blimpeza cirúrgica\b|"
+                r"\bcoleta de culturas?\b",
+                "Limpeza cirúrgica",
+            ),
+            (
+                r"\bartroplastia\b|\bptq\b|\bpta\b|"
+                r"\bprotese total (?:de )?(?:quadril|joelho)\b|"
+                r"\brevisao (?:total )?(?:de )?(?:ptq|pta|protese)\b|"
+                r"\brevisao acetabular\b",
+                "Artroplastia",
+            ),
             (r"\bangioplastia\b", "Angioplastia"),
             (r"\blaparotomia\b", "Laparotomia"),
             (r"\bvideolaparoscopia\b|\bvlp\b", "Videolaparoscopia"),
@@ -2231,7 +2247,6 @@ def run_html_fill(
             next_sec("200007")
             has_surgical_step = False
     if has_surgical_step:
-        open_sec("200007")
         evolution_text = value("evolucao")
         normalized_evolution = normalized_text(evolution_text)
         inferred_procedure = infer_surgical_procedure(evolution_text)
@@ -2253,34 +2268,41 @@ def run_html_fill(
             if completed_surgery or (inferred_procedure and not planned_surgery)
             else value_or("Conduta Clínica - Realizado procedimento cirúrgico? *", "Não")
         )
-        click_radio("200007", "clinical-conduct-surgical-yn", surgery_yn)
-        click_radio_value(
-            "200007",
-            "clinical-conduct-surgical-yn",
-            "SIM" if surgery_yn.lower().startswith("s") else "NAO",
-        )
-        if surgery_yn.lower().startswith("s"):
-            choose_multi(
-                "200007",
-                "#padrao-tiss-search-multi-select-0",
-                value("Conduta Clínica - TUSS + Nome do Procedimento * (cond.)")
-                or inferred_procedure,
+        if not surgery_yn.lower().startswith("s") and not has_explicit_surgical_info:
+            all_logs.append(
+                "Dados Cirúrgicos ignorado: paciente sem procedimento cirúrgico explícito"
             )
-            fill_surgical_quantities("200007")
-            click_radio(
+            has_surgical_step = False
+        if has_surgical_step:
+            open_sec("200007")
+            click_radio("200007", "clinical-conduct-surgical-yn", surgery_yn)
+            click_radio_value(
                 "200007",
-                "clinical-conduct-anesthesia-269",
-                value_or("Conduta Clínica - Tipo de anestesia * (cond.)", "Geral"),
+                "clinical-conduct-surgical-yn",
+                "SIM" if surgery_yn.lower().startswith("s") else "NAO",
             )
-            click_radio(
-                "200007",
-                "clinical-conduct-intraoperative-complications",
-                value_or(
-                    "Conduta Clínica - Houve intercorrências no intraoperatório? * (cond.)",
-                    "Não",
-                ),
-            )
-        next_sec("200007")
+            if surgery_yn.lower().startswith("s"):
+                choose_multi(
+                    "200007",
+                    "#padrao-tiss-search-multi-select-0",
+                    value("Conduta Clínica - TUSS + Nome do Procedimento * (cond.)")
+                    or inferred_procedure,
+                )
+                fill_surgical_quantities("200007")
+                click_radio(
+                    "200007",
+                    "clinical-conduct-anesthesia-269",
+                    value_or("Conduta Clínica - Tipo de anestesia * (cond.)", "Geral"),
+                )
+                click_radio(
+                    "200007",
+                    "clinical-conduct-intraoperative-complications",
+                    value_or(
+                        "Conduta Clínica - Houve intercorrências no intraoperatório? * (cond.)",
+                        "Não",
+                    ),
+                )
+            next_sec("200007")
 
     open_sec("100002")
     click_radio("100002", "physical-exam-general-state", value("Exame Físico - Estado geral *"))
