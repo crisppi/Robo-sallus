@@ -50,6 +50,11 @@ class PreencherEvolucoesExcelTests(unittest.TestCase):
         self.assertGreaterEqual(hour, "08:00")
         self.assertLessEqual(hour, "12:30")
 
+    def test_explicit_icu_accommodation_is_extracted(self):
+        values = extract("Paciente permanece em UTI, estável, em monitorização.", 2)
+
+        self.assertEqual(values["Dados da Internação - Acomodação *"], "UTI")
+
 
 if __name__ == "__main__":
     unittest.main()

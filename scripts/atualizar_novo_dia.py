@@ -306,6 +306,11 @@ def generate_clinical_base(
                 if not column or inferred_value in (None, ""):
                     continue
                 current_value = sheet.cell(row_number, column).value
+                if header == "Dados da Internação - Acomodação *":
+                    if str(inferred_value).strip().casefold() == "uti":
+                        sheet.cell(row_number, column).value = inferred_value
+                        row_writes += 1
+                    continue
                 if current_value in (None, ""):
                     sheet.cell(row_number, column).value = inferred_value
                     row_writes += 1

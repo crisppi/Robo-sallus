@@ -389,6 +389,64 @@ class AtualizarNovoDiaTests(unittest.TestCase):
         )
         self.assertIsNone(result_sheet.cell(4, high_column).fill.fill_type)
 
+    def test_icu_evolution_overrides_reused_apartment_accommodation(self):
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "Preenchimento"
+        sheet.append(
+            [
+                "Nome",
+                "Iniciais",
+                "Senha",
+                "Dias internado",
+                "ID internação",
+                "Dados da Internação - Acomodação *",
+                "Data da evolução",
+                "evolucao",
+            ]
+        )
+        sheet.append(
+            [
+                "Paciente UTI",
+                "PU",
+                "UTI001",
+                4,
+                701,
+                "Apartamento / Enfermaria",
+                "05/08/2026",
+                "Paciente segue em UTI, em monitorização contínua.",
+            ]
+        )
+        patients = [
+            {
+                "nomeCompleto": "Paciente UTI",
+                "nomeIniciais": "PU",
+                "senha": "UTI001",
+                "diasInternados": 5,
+                "idInternacao": 701,
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory) / "base.xlsx"
+            generate_clinical_base(
+                patients,
+                Path("modelo_nao_usado.xlsx"),
+                output,
+                previous_workbook=workbook,
+                evolution_date=date(2026, 8, 6),
+            )
+            result = load_workbook(output)
+
+        result_sheet = result["Preenchimento"]
+        columns = {str(cell.value): cell.column for cell in result_sheet[1] if cell.value}
+        self.assertEqual(
+            result_sheet.cell(
+                2, columns["Dados da Internação - Acomodação *"]
+            ).value,
+            "UTI",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -244,6 +244,16 @@ def active_drugs(text: str) -> dict[str, str]:
     return result
 
 
+def accommodation(text: str) -> str | None:
+    normalized = plain(text)
+    if re.search(
+        r"\b(?:uti|cti|uco)\b|unidade\s+(?:de\s+)?(?:terapia\s+intensiva|coronariana)",
+        normalized,
+    ):
+        return "UTI"
+    return None
+
+
 def extract(
     text: str,
     days: object,
@@ -253,6 +263,10 @@ def extract(
     seed: str = "",
 ) -> dict[str, object]:
     result: dict[str, object] = {}
+    patient_accommodation = accommodation(text)
+    if patient_accommodation:
+        result["Dados da Internação - Acomodação *"] = patient_accommodation
+
     cid, _cid_reason = infer_cid_suggestion(text)
     if cid:
         result["Dados da Internação - CID de internação *"] = cid
