@@ -39,13 +39,34 @@ def normalize(value: object) -> str:
     return " ".join(text.split())
 
 
-def extract_discharges(pdf: Path) -> list[Discharge]:
-    completed = subprocess.run(
-        ["pdftotext", "-tsv", str(pdf), "-"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+def pdf_words(pdf: Path) -> list[dict[str, object]]:
+    try:
+        completed = subprocess.run(
+            ["pdftotext", "-tsv", str(pdf), "-"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        import pdfplumber
+
+        words = []
+        with pdfplumber.open(pdf) as document:
+            for page_number, page in enumerate(document.pages, 1):
+                for word in page.extract_words(x_tolerance=1, y_tolerance=3):
+                    text = str(word.get("text") or "").strip()
+                    if not text:
+                        continue
+                    words.append(
+                        {
+                            "page": page_number,
+                            "left": float(word["x0"]),
+                            "top": float(word["top"]),
+                            "text": text,
+                        }
+                    )
+        return words
+
     words = []
     for item in csv.DictReader(io.StringIO(completed.stdout), delimiter="\t"):
         if item.get("level") != "5" or not item.get("text"):
@@ -58,6 +79,11 @@ def extract_discharges(pdf: Path) -> list[Discharge]:
                 "text": item["text"].strip(),
             }
         )
+    return words
+
+
+def extract_discharges(pdf: Path) -> list[Discharge]:
+    words = pdf_words(pdf)
 
     births = sorted(
         [
@@ -101,7 +127,7 @@ def extract_discharges(pdf: Path) -> list[Discharge]:
                 for word in words
                 if word["page"] == birth["page"]
                 and abs(word["top"] - birth["top"]) < 0.7
-                and 648 <= word["left"] < 678
+                and 610 <= word["left"] < 678
                 and re.fullmatch(r"\d{2}:\d{2}", word["text"])
             ),
             None,
@@ -121,24 +147,7 @@ def extract_discharges(pdf: Path) -> list[Discharge]:
 
 
 def extract_inpatient_names(pdf: Path) -> list[str]:
-    completed = subprocess.run(
-        ["pdftotext", "-tsv", str(pdf), "-"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    words = []
-    for item in csv.DictReader(io.StringIO(completed.stdout), delimiter="\t"):
-        if item.get("level") != "5" or not item.get("text"):
-            continue
-        words.append(
-            {
-                "page": int(item["page_num"]),
-                "left": float(item["left"]),
-                "top": float(item["top"]),
-                "text": item["text"].strip(),
-            }
-        )
+    words = pdf_words(pdf)
     births = sorted(
         [
             word

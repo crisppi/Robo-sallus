@@ -2224,8 +2224,12 @@ def run_html_fill(
     surgery_yn = value_or(
         "Conduta Clínica - Realizado procedimento cirúrgico? *", "Não"
     )
+    explicit_surgery_value = value("Conduta Clínica - Realizado procedimento cirúrgico? *").strip()
     has_explicit_surgical_info = bool(
-        value("Conduta Clínica - Realizado procedimento cirúrgico? *").strip()
+        (
+            explicit_surgery_value
+            and not explicit_surgery_value.lower().startswith("n")
+        )
         or value("Conduta Clínica - TUSS + Nome do Procedimento * (cond.)").strip()
     )
     force_clinical = (
