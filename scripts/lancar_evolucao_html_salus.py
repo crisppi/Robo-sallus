@@ -654,7 +654,7 @@ def run_html_fill(
           const values = {json.dumps(payload["values"], ensure_ascii=False)};
           const logs = [];
           const expectedSecao = {json.dumps(secao)};
-          for (let i = 0; i < 30; i++) {{
+          for (let i = 0; i < 120; i++) {{
             const controlsReady = document.querySelectorAll('input,button,textarea,select').length > 20;
             if (location.href.includes(`/secao/${{expectedSecao}}`) && controlsReady) break;
             await new Promise(resolve => setTimeout(resolve, 500));
@@ -673,7 +673,7 @@ def run_html_fill(
           }};
           return await Promise.race([
             doActions(),
-            new Promise(resolve => setTimeout(() => resolve([...logs, 'timeout interno da secao']), 10000))
+            new Promise(resolve => setTimeout(() => resolve([...logs, 'timeout interno da secao']), 30000))
           ]);
         }})()
         """
@@ -681,7 +681,7 @@ def run_html_fill(
             script,
             cdp_url=cdp_url,
             url_contains=target_key,
-            timeout_seconds=35,
+            timeout_seconds=95,
         ) or []
         if any(log == "proximo solicitado" for log in logs):
             evaluate_js(

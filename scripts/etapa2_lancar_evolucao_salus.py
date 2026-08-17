@@ -600,6 +600,8 @@ def read_clinical(path: Path) -> tuple[dict[str, list[ClinicalPatient]], dict[st
             for header, col in headers.items()
             if header in field_headers
         }
+        if census_discharge_col:
+            values["Alta (data e hora)"] = ws.cell(row, census_discharge_col).value
         evolution_text = value_to_text(values.get("evolucao"))
         normalized_evolution = evolution_text.lower()
         if any(term in normalized_evolution for term in ("dialise pausada", "diálise pausada", "pausado dialise", "pausada dialise")):

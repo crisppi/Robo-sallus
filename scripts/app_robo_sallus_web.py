@@ -25,6 +25,7 @@ from openpyxl import load_workbook
 from etapa2_lancar_evolucao_salus import (
     PatientResult,
     QueuePatient,
+    parse_census_discharge,
     process_patients,
     read_clinical,
     read_queue,
@@ -149,7 +150,7 @@ def calculate_cards() -> dict:
         for senha in queue_passwords
         if senha in clinical_by_password
         and len(clinical_by_password[senha]) == 1
-        and value_to_text(clinical_by_password[senha][0].values.get("evolucao")).strip()
+        and has_launchable_content(clinical_by_password[senha][0].values)
     }
     finalized_passwords = {
         senha
@@ -168,6 +169,12 @@ def calculate_cards() -> dict:
         "faltam": missing_to_launch,
         "processados": processed,
     }
+
+
+def has_launchable_content(values: dict) -> bool:
+    if value_to_text(values.get("evolucao")).strip():
+        return True
+    return parse_census_discharge(values.get("Alta (data e hora)")) is not None
 
 
 def refresh_cards(update_status: bool = True) -> dict:
@@ -380,12 +387,13 @@ def run_etapa2_worker(
             # esses registros da trava de duplicidade e mantém finalizados protegidos.
             attempted_passwords.difference_update(error_passwords)
 
-        # Somente pacientes com evolução textual, ainda não tentados, entram no lote.
+        # Pacientes com evolução textual ou alta datada, ainda não tentados,
+        # entram no lote.
         eligible_passwords = {
             senha
             for senha, rows in clinical_by_password.items()
             if len(rows) == 1
-            and value_to_text(rows[0].values.get("evolucao")).strip()
+            and has_launchable_content(rows[0].values)
             and senha not in attempted_passwords
             and (not retry_errors or senha in error_passwords)
         }
