@@ -931,7 +931,7 @@ def run_html_fill(
         }
         section_title = section_titles.get(secao, "")
         last_error = ""
-        for navigation_attempt in range(3):
+        for navigation_attempt in range(5):
             actual_section = resolved_section_ids.get(secao, secao)
             try:
                 navigate_salus(
@@ -948,7 +948,7 @@ def run_html_fill(
             # Nunca aguarda uma navegação dentro da mesma Runtime.evaluate.
             # Quando o clique do stepper troca a rota Angular, o contexto JS
             # anterior é destruído e o CDP ficava preso por 120 segundos.
-            for readiness_attempt in range(24):
+            for readiness_attempt in range(48):
                 try:
                     ready = evaluate_js(
                         f"""
@@ -990,7 +990,7 @@ def run_html_fill(
                         """,
                         cdp_url=cdp_url,
                         url_contains=f"/avaliacao-internacao/{clinical_patient.id_internacao}/",
-                        timeout_seconds=15,
+                        timeout_seconds=25,
                     )
                 except SalusCdpError as exc:
                     last_error = str(exc)
@@ -1003,7 +1003,7 @@ def run_html_fill(
                             f"Secao {secao} resolvida como {resolved_section_ids[secao]}"
                         )
                     return
-                time.sleep(1.0 if isinstance(ready, dict) and ready.get("clicked") else 0.5)
+                time.sleep(1.2 if isinstance(ready, dict) and ready.get("clicked") else 0.8)
             all_logs.append(
                 f"Secao {secao} nao carregou; nova tentativa de abertura"
             )
@@ -1991,7 +1991,7 @@ def run_html_fill(
         time.sleep(0.8)
         completed = False
         stable_completed_reads = 0
-        for _ in range(32):
+        for _ in range(64):
             try:
                 step_state = evaluate_js(
                         f"""
@@ -2011,7 +2011,7 @@ def run_html_fill(
                         """,
                         cdp_url=cdp_url,
                         url_contains=f"/avaliacao-internacao/{clinical_patient.id_internacao}/",
-                        timeout_seconds=10,
+                        timeout_seconds=20,
                     )
             except SalusCdpError:
                 step_state = {}
@@ -2025,7 +2025,7 @@ def run_html_fill(
             )
             if stable_completed_reads >= 2:
                 break
-            time.sleep(0.5)
+            time.sleep(0.8)
         completed = stable_completed_reads >= 2
         if not completed and not allow_incomplete:
             raise RuntimeError(f"Página {title} não ficou verde; lote interrompido neste paciente.")
@@ -2541,7 +2541,8 @@ def run_html_fill(
         "100005",
         value_or("Dados da Internação - Acomodação *", "Apartamento / Enfermaria"),
     )
-    click_auditor_radio_label("100005", value_or("Parecer do Auditor - Programação de alta * (cond.)", "Sem programação de alta"))
+    if not remains_admitted.lower().startswith("n"):
+        click_auditor_radio_label("100005", value_or("Parecer do Auditor - Programação de alta * (cond.)", "Sem programação de alta"))
     operator_pending = value("Parecer do Auditor - Pendências da operadora (cond.)")
     if operator_pending:
         for item in operator_pending.split(";"):

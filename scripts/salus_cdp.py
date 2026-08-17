@@ -162,7 +162,7 @@ def evaluate_js(
     expression: str,
     cdp_url: str = DEFAULT_CDP,
     url_contains: str | None = None,
-    timeout_seconds: float = 120.0,
+    timeout_seconds: float = 180.0,
 ) -> Any:
     tab = find_salus_tab(cdp_url, url_contains=url_contains)
     ws = websocket.create_connection(
