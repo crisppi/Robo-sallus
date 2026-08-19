@@ -33,6 +33,8 @@ from etapa2_lancar_evolucao_salus import (
     value_to_text,
     write_report,
 )
+from materializar_uti_semi import create_backup as backup_uti_semi_base
+from materializar_uti_semi import materialize as materialize_uti_semi
 from salus_cdp import SalusCdpError, navigate_salus, start_salus_chrome
 
 
@@ -349,6 +351,19 @@ def run_etapa2_worker(
         clinica = Path(files["clinica"])
         relatorio = Path(files["relatorio"])
         log("Etapa 2 iniciada: lancamento automatico direto no Salus.")
+        uti_backup = backup_uti_semi_base(clinica)
+        uti_stats = materialize_uti_semi(clinica)
+        log(
+            "Preparo UTI/SEMI: "
+            f"{uti_stats['linhas_uti_semi']} linha(s), "
+            f"{uti_stats['celulas_preenchidas']} celula(s) preenchida(s). "
+            f"Backup: {uti_backup}"
+        )
+        if uti_stats["faltas"]:
+            sample = ", ".join(senha for senha, _missing in uti_stats["faltas"][:5])
+            raise RuntimeError(
+                f"Preparo UTI/SEMI deixou {len(uti_stats['faltas'])} linha(s) com falta: {sample}."
+            )
 
         queue_patients = read_queue(fila)
         clinical_by_password, field_meta, field_headers = read_clinical(clinica)

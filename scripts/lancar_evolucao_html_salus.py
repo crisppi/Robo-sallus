@@ -162,6 +162,22 @@ def filled_values(clinical_patient: ClinicalPatient) -> dict[str, str]:
         values["Exame Físico - Controle de eliminação *"] = "Normal"
     values.setdefault("UTI - Monitorização *", "Não")
     values.setdefault("UTI - Uso de droga vasoativa? *", "Não")
+    values.setdefault(
+        "UTI - 1. Abertura Ocular (E) - Selecione a melhor resposta observada. *",
+        "NT – Não testável (ex.: olhos fechados por fator local)",
+    )
+    values.setdefault(
+        "UTI - 2. Resposta Verbal (V) - Avaliar conteúdo da comunicação verbal. *",
+        "NT – Não testável (ex.: intubação, afasia)",
+    )
+    values.setdefault(
+        "UTI - 3. Melhor Resposta Motora (M) - Registrar a melhor resposta obtida. *",
+        "NT – Não testável (fator limitante)",
+    )
+    values.setdefault(
+        "UTI - 4. Resposta Pupilar (P) - Avaliar reatividade pupilar ao estímulo luminoso. *",
+        "0 – Reação bilateral ao estímulo",
+    )
     for lab_field, flag_field in [
         ("UTI - Creatinina sérica (mg/dL) *", "UTI - Não mensurado * (cond.)"),
         ("UTI - pH arterial *", "UTI - Não mensurado * (cond.) [2]"),
@@ -948,7 +964,7 @@ def run_html_fill(
             # Nunca aguarda uma navegação dentro da mesma Runtime.evaluate.
             # Quando o clique do stepper troca a rota Angular, o contexto JS
             # anterior é destruído e o CDP ficava preso por 120 segundos.
-            for readiness_attempt in range(48):
+            for readiness_attempt in range(72):
                 try:
                     ready = evaluate_js(
                         f"""
@@ -990,7 +1006,7 @@ def run_html_fill(
                         """,
                         cdp_url=cdp_url,
                         url_contains=f"/avaliacao-internacao/{clinical_patient.id_internacao}/",
-                        timeout_seconds=25,
+                        timeout_seconds=45,
                     )
                 except SalusCdpError as exc:
                     last_error = str(exc)
@@ -1207,7 +1223,6 @@ def run_html_fill(
             .filter(el => !/pesquisar|busque/i.test(String(el.placeholder || '')));
           let filled = 0;
           for (const input of inputs) {
-            if (String(input.value || '').trim()) continue;
             input.focus();
             input.value = '1';
             for (const eventName of ['input', 'change', 'blur']) {
@@ -1215,7 +1230,7 @@ def run_html_fill(
             }
             filled += 1;
           }
-          return `quantidades cirurgicas preenchidas=${filled}`;
+          return `quantidades cirurgicas forçadas=1 em ${filled} campo(s)`;
         })()
         """
         all_logs.append(str(eval_sec(secao, js)))
@@ -1365,6 +1380,7 @@ def run_html_fill(
         js = f"""
         (() => {{
           const norm = (value) => String(value ?? '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toLowerCase();
+          const compact = (value) => norm(value).replace(/[–—-]/g, ' ').replace(/[^a-z0-9]+/g, ' ').trim();
           const visible = (el) => {{
             const rect = el.getBoundingClientRect();
             const style = getComputedStyle(el);
@@ -1372,10 +1388,25 @@ def run_html_fill(
           }};
           const labelOf = (el) => norm(el.closest('label')?.innerText || el.parentElement?.innerText || el.parentElement?.parentElement?.innerText || el.value);
           const wanted = norm({json.dumps(val)});
+          const wantedCompact = compact({json.dumps(val)});
           const wantedValue = wanted === 'sim' ? 'sim' : (wanted === 'nao' ? 'nao' : wanted);
           const items = [...document.querySelectorAll(`input[name="${{CSS.escape({json.dumps(name)})}}"]`)]
             .filter(visible);
-          const el = items.find(input => norm(input.value) === wanted || labelOf(input) === wanted || labelOf(input).includes(wanted));
+          const el = items.find(input => {{
+            const label = labelOf(input);
+            const labelCompact = compact(label);
+            const valueCompact = compact(input.value);
+            return norm(input.value) === wanted
+              || label === wanted
+              || label.includes(wanted)
+              || wanted.includes(label)
+              || valueCompact === wantedCompact
+              || labelCompact === wantedCompact
+              || labelCompact.includes(wantedCompact)
+              || wantedCompact.includes(labelCompact)
+              || (wantedCompact.startsWith('nt nao testavel') && labelCompact.startsWith('nt nao testavel'))
+              || (wantedCompact.startsWith('0 reacao bilateral') && labelCompact.startsWith('0 reacao bilateral'));
+          }});
           if (!el) return `opcao nao encontrada: {name}`;
           const byValue = items.find(input => norm(input.value) === wantedValue);
           const target = byValue || el;
@@ -1386,6 +1417,66 @@ def run_html_fill(
         }})()
         """
         all_logs.append(str(eval_sec(secao, js)))
+
+    def complete_unchecked_uti_radios(secao: str) -> None:
+        js = """
+        (() => {
+          const visible = (el) => {
+            const rect = el.getBoundingClientRect();
+            const style = getComputedStyle(el);
+            return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+          };
+          const groups = new Map();
+          for (const input of [...document.querySelectorAll('input[type="radio"]')].filter(visible)) {
+            if (!input.name) continue;
+            if (!groups.has(input.name)) groups.set(input.name, []);
+            groups.get(input.name).push(input);
+          }
+          const clicked = [];
+          for (const [name, items] of groups.entries()) {
+            if (items.some(input => input.checked)) continue;
+            const target = items.find(input => /NAO|NAO_INVASIVA|NT_NAO_TESTAV|0_REACAO/i.test(input.value))
+              || items[items.length - 1];
+            if (!target) continue;
+            target.scrollIntoView({block: 'center'});
+            target.click();
+            for (const eventName of ['input', 'change', 'blur']) {
+              target.dispatchEvent(new Event(eventName, {bubbles: true}));
+            }
+            clicked.push(`${name}=${target.value}`);
+          }
+          return `uti radios fallback: ${clicked.join('; ')}`;
+        })()
+        """
+        all_logs.append(str(eval_sec(secao, js)))
+
+    def current_page_diagnostics(secao: str) -> str:
+        js = """
+        (() => {
+          const visible = (el) => {
+            const rect = el.getBoundingClientRect();
+            const style = getComputedStyle(el);
+            return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+          };
+          const invalid = [...document.querySelectorAll('.ng-invalid, .is-invalid, [aria-invalid="true"]')]
+            .filter(visible)
+            .map(el => (el.innerText || el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.id || el.getAttribute('name') || el.tagName).slice(0, 120))
+            .filter(Boolean)
+            .slice(0, 12);
+          const uncheckedGroups = [];
+          const groups = new Map();
+          for (const input of [...document.querySelectorAll('input[type="radio"]')].filter(visible)) {
+            if (!input.name) continue;
+            if (!groups.has(input.name)) groups.set(input.name, []);
+            groups.get(input.name).push(input);
+          }
+          for (const [name, items] of groups.entries()) {
+            if (!items.some(input => input.checked)) uncheckedGroups.push(name);
+          }
+          return JSON.stringify({invalid, uncheckedGroups});
+        })()
+        """
+        return str(eval_sec(secao, js))
 
     def click_radio_value(secao: str, name: str, val: str) -> None:
         if not val:
@@ -1991,7 +2082,7 @@ def run_html_fill(
         time.sleep(0.8)
         completed = False
         stable_completed_reads = 0
-        for _ in range(64):
+        for _ in range(90):
             try:
                 step_state = evaluate_js(
                         f"""
@@ -2011,7 +2102,7 @@ def run_html_fill(
                         """,
                         cdp_url=cdp_url,
                         url_contains=f"/avaliacao-internacao/{clinical_patient.id_internacao}/",
-                        timeout_seconds=20,
+                        timeout_seconds=35,
                     )
             except SalusCdpError:
                 step_state = {}
@@ -2028,7 +2119,17 @@ def run_html_fill(
             time.sleep(0.8)
         completed = stable_completed_reads >= 2
         if not completed and not allow_incomplete:
-            raise RuntimeError(f"Página {title} não ficou verde; lote interrompido neste paciente.")
+            diagnostics = current_page_diagnostics(secao)
+            if secao == "100003" and "acquired-condition-yn" in diagnostics:
+                all_logs.append(
+                    "Conduta avançou para Condição Adquirida antes do check verde; seguindo para marcar Não."
+                )
+                print(f"HTML: secao {secao} avancou para condicao adquirida", flush=True)
+                return
+            raise RuntimeError(
+                f"Página {title} não ficou verde; lote interrompido neste paciente. "
+                f"Diagnóstico: {diagnostics}"
+            )
         print(f"HTML: secao {secao} finalizada", flush=True)
 
     def finish_at_summary(missing_cid: bool) -> dict[str, Any]:
@@ -2036,7 +2137,7 @@ def run_html_fill(
         summary: dict[str, Any] = {}
         # Faz leituras curtas do estado do resumo. Não mantém uma execução
         # JavaScript aberta enquanto o Angular troca a rota.
-        for _ in range(40):
+        for _ in range(60):
             summary = eval_sec(
                 "100008",
                 """
@@ -2066,7 +2167,7 @@ def run_html_fill(
             )
             if summary.get("confirmEnabled") or summary.get("incompleteSteps"):
                 break
-            time.sleep(0.2)
+            time.sleep(0.5)
 
         if confirmar and summary.get("confirmEnabled"):
             # Agenda o clique para depois da resposta do CDP; assim a troca de
@@ -2088,8 +2189,8 @@ def run_html_fill(
             )
             save_ready = False
             if confirm_clicked:
-                time.sleep(0.8)
-                for _ in range(20):
+                time.sleep(1.2)
+                for _ in range(40):
                     try:
                         save_ready = bool(
                             evaluate_js(
@@ -2102,14 +2203,14 @@ def run_html_fill(
                                 """,
                                 cdp_url=cdp_url,
                                 url_contains=f"/avaliacao-internacao/{clinical_patient.id_internacao}/",
-                                timeout_seconds=10,
+                                timeout_seconds=20,
                             )
                         )
                     except SalusCdpError:
                         save_ready = False
                     if save_ready:
                         break
-                    time.sleep(0.25)
+                    time.sleep(0.5)
             saved = False
             if save_ready:
                 saved = bool(
@@ -2126,10 +2227,10 @@ def run_html_fill(
                         """,
                         cdp_url=cdp_url,
                         url_contains=f"/avaliacao-internacao/{clinical_patient.id_internacao}/",
-                        timeout_seconds=10,
+                        timeout_seconds=20,
                     )
                 )
-                time.sleep(1.5)
+                time.sleep(2.5)
             summary["confirmed"] = confirm_clicked
             summary["saved"] = saved
         summary["logs"] = all_logs
@@ -2399,6 +2500,7 @@ def run_html_fill(
                     value("UTI - Drogas vasoativas em uso * (cond.)"),
                 )
             fill_uti_labs("100006")
+            complete_unchecked_uti_radios("100006")
             next_sec("100006")
 
     open_sec("100003")
@@ -2480,6 +2582,7 @@ def run_html_fill(
     click_radio("100003", "clinical-conduct-surgical-procedure", surgery_yn)
     if surgery_yn.lower().startswith("s"):
         choose_multi("100003", "#padrao-tiss-search-multi-select-0", value("Conduta Clínica - TUSS + Nome do Procedimento * (cond.)"))
+        fill_surgical_quantities("100003")
         click_radio("100003", "clinical-conduct-anesthesia-107", value("Conduta Clínica - Tipo de anestesia * (cond.)"))
         click_radio("100003", "clinical-conduct-intraoperative-complications", value_or("Conduta Clínica - Houve intercorrências no intraoperatório? * (cond.)", "Não"))
     next_sec("100003")

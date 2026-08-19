@@ -28,6 +28,7 @@ Projeto para automatizar o acesso e preenchimento de elementos no portal Salus/O
 - `scripts/gerar_planilha_evolucao.py`: gera a planilha de evolucao clinica com campos em colunas.
 - `scripts/colorir_planilha_evolucao.py`: colore a aba `Preenchimento` por bloco/etapa.
 - `scripts/aplicar_listas_excel.py`: aplica listas suspensas para campos de escolha unica e orienta campos de multipla escolha.
+- `scripts/materializar_uti_semi.py`: preenche campos UTI obrigatorios vazios para pacientes em UTI ou SEMI.
 - `scripts/etapa2_lancar_evolucao_salus.py`: executa a regra da etapa 2 em modo simulacao ou lancamento real.
 
 Exemplos:
@@ -37,6 +38,7 @@ python3 scripts/atualizar_novo_dia.py
 python3 scripts/gerar_lista_pacientes.py
 python3 scripts/colorir_planilha_evolucao.py
 python3 scripts/aplicar_listas_excel.py
+python3 scripts/materializar_uti_semi.py
 python3 scripts/etapa2_lancar_evolucao_salus.py --limite 5
 ```
 
@@ -53,6 +55,15 @@ real pela tela HTML do Salus; a confirmacao exibida antes de iniciar serve para
 evitar cliques acidentais. O campo **Somente senha** e opcional. Quando vazio,
 o robo percorre todos os pacientes pendentes; quando preenchido, processa
 somente a senha informada.
+
+Antes da Etapa 2, a tela web executa automaticamente o preparo UTI/SEMI:
+pacientes com acomodacao `UTI` ou `SEMI` recebem os campos obrigatorios de UTI
+que ainda estiverem vazios, com backup em `exports/arquivo`. Para rodar esse
+preparo manualmente:
+
+```bash
+python3 scripts/materializar_uti_semi.py exports/data_base_lancar_DD_MM_AAAA.xlsx
+```
 
 Para abrir a tela do robo:
 

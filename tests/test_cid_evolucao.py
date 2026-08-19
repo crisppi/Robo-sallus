@@ -44,6 +44,19 @@ class CidEvolutionTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(infer_cid_from_evolution(text), expected)
 
+    def test_recent_uncoded_evolutions(self):
+        cases = {
+            "1o DIH por dor torácica A/E reentrante": "R07.4",
+            "Programação de marca-passo para exame de colonoscopia": "Z45.0",
+            "RM evidenciou formação cística multilobulada, provável natureza gangliônica": "M67.4",
+            "Submetida a hemorroidectomia por prolapso hemorroidário": "K64.8",
+            "TC de tórax demonstrando bronquite inflamatória": "J40",
+            "Déficit neurológico agudo compatível com AVC lacunar": "I63.9",
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(infer_cid_from_evolution(text), expected)
+
 
 if __name__ == "__main__":
     unittest.main()

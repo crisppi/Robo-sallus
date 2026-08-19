@@ -254,6 +254,88 @@ def accommodation(text: str) -> str | None:
     return None
 
 
+def surgical_procedure(text: str) -> str:
+    normalized = plain(text)
+    procedures = (
+        (r"\bap[e]?ndicectomia\b", "Apendicectomia"),
+        (r"\bcolecistectomia\b", "Colecistectomia"),
+        (r"\bosteossintese\b|\bosteosintese\b", "Osteossíntese"),
+        (
+            r"\brtup\b|\bressecao transuretral (?:da )?prostata\b",
+            "Ressecção endoscópica da próstata",
+        ),
+        (
+            r"\bureterolitotripsia\b|\bult flex\b",
+            "Ureterorrenolitotripsia flexível a laser unilateral",
+        ),
+        (
+            r"\bretirad[ao] (?:do |de )?cateter duplo j\b|"
+            r"\bretirad[ao] (?:do |de )?duplo j\b",
+            "Retirada de cateter duplo J",
+        ),
+        (r"\bherniorrafia\b", "Herniorrafia"),
+        (r"\bhemorroidectomia\b", "Hemorroidectomia"),
+        (r"\bdrenagem (?:de )?(?:abscesso|colecao)\b", "Drenagem de abscesso"),
+        (
+            r"\blimpeza cirurgica\b|\bcoleta de culturas?\b",
+            "Limpeza cirúrgica",
+        ),
+        (
+            r"\bartroplastia\b|\bptq\b|\bpta\b|"
+            r"\bprotese total (?:de )?(?:quadril|joelho)\b|"
+            r"\brevisao (?:total )?(?:de )?(?:ptq|pta|protese)\b|"
+            r"\brevisao acetabular\b",
+            "Artroplastia",
+        ),
+        (r"\bangioplastia\b", "Angioplastia"),
+        (r"\blaparotomia\b", "Laparotomia"),
+        (r"\bvideolaparoscopia\b|\bvlp\b", "Videolaparoscopia"),
+        (r"\btoracoscopia\b", "Toracoscopia"),
+        (r"\bcraniotomia\b", "Craniotomia"),
+        (r"\bmastectomia\b", "Mastectomia"),
+        (r"\bhisterectomia\b", "Histerectomia"),
+        (r"\bprostatectomia\b", "Prostatectomia"),
+        (r"\bcolectomia\b", "Colectomia"),
+    )
+    return next(
+        (label for pattern, label in procedures if re.search(pattern, normalized)),
+        "",
+    )
+
+
+def surgical(text: str) -> dict[str, object]:
+    normalized = plain(text)
+    procedure = surgical_procedure(text)
+    completed_surgery = re.search(
+        r"\b(?:po|pos[- ]?operatorio|submetid[oa]|procedimento sem intercorrencias|"
+        r"apos (?:a |o )?(?:cirurgia|procedimento|drenagem)|"
+        r"realizad[oa] (?:a |o )?(?:cirurgia|procedimento|drenagem))\b",
+        normalized,
+    )
+    planned_surgery = re.search(
+        r"\b(?:procedimento proposto|procedimentos propostos|"
+        r"tratamento cirurgico (?:de )?urgencia|opta[- ]?se (?:por )?tratamento cirurgico|"
+        r"solicito internacao.*tratamento cirurgico|programacao cirurgica|"
+        r"avaliacao pre[- ]?anestesica)\b",
+        normalized,
+    )
+    if not completed_surgery and (not procedure or planned_surgery):
+        return {}
+    result: dict[str, object] = {
+        "Conduta Clínica - Realizado procedimento cirúrgico? *": "Sim",
+    }
+    if procedure:
+        result["Conduta Clínica - TUSS + Nome do Procedimento * (cond.)"] = procedure
+        result["Conduta Clínica - Quantidade Solicitada * (cond.)"] = 1
+        result["Conduta Clínica - Quantidade Autorizada * (cond.)"] = 1
+        result["Conduta Clínica - Quantidade Realizada * (cond.)"] = 1
+        result["Conduta Clínica - Tipo de anestesia * (cond.)"] = "Geral"
+        result[
+            "Conduta Clínica - Houve intercorrências no intraoperatório? * (cond.)"
+        ] = "Não"
+    return result
+
+
 def extract(
     text: str,
     days: object,
@@ -305,6 +387,7 @@ def extract(
     result.update(respiratory(text))
     result.update(access_and_elimination(text))
     result.update(active_drugs(text))
+    result.update(surgical(text))
     discharge = resolve_discharge(
         text,
         census_value=census_discharge,
@@ -333,6 +416,16 @@ def main() -> int:
         "--atualizar-altas",
         action="store_true",
         help="Atualiza os campos de alta e a coluna Alta (data e hora).",
+    )
+    parser.add_argument(
+        "--preservar-acomodacao",
+        action="store_true",
+        help="Nao altera a coluna de acomodacao revisada manualmente.",
+    )
+    parser.add_argument(
+        "--preservar-alta",
+        action="store_true",
+        help="Nao altera a coluna Alta (data e hora), mas atualiza os campos de desfecho.",
     )
     args = parser.parse_args()
 
@@ -396,6 +489,8 @@ def main() -> int:
             }
         row_writes = 0
         for header, value in values.items():
+            if args.preservar_acomodacao and header == "Dados da Internação - Acomodação *":
+                continue
             column = headers.get(header)
             if column and value not in (None, ""):
                 if args.somente_vazios and not args.atualizar_altas:
@@ -413,6 +508,7 @@ def main() -> int:
             high_column
             and evolution_datetime
             and parse_census_discharge(census_value) is None
+            and not args.preservar_alta
         ):
             high_cell = sheet.cell(row, high_column)
             high_cell.value = evolution_datetime
