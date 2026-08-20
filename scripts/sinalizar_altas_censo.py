@@ -143,6 +143,63 @@ def extract_discharges(pdf: Path) -> list[Discharge]:
                 ),
             )
         )
+    if discharges:
+        return discharges
+
+    discharge_dates = sorted(
+        [
+            word
+            for word in words
+            if re.fullmatch(r"\d{2}/\d{2}/\d{4}", word["text"])
+            and 720 <= word["left"] < 760
+            and word["top"] > 105
+        ],
+        key=lambda word: (word["page"], word["top"]),
+    )
+    for index, discharge_date_word in enumerate(discharge_dates):
+        next_top = 540.0
+        if (
+            index + 1 < len(discharge_dates)
+            and discharge_dates[index + 1]["page"] == discharge_date_word["page"]
+        ):
+            next_top = discharge_dates[index + 1]["top"] - 0.5
+
+        discharge_time = next(
+            (
+                word["text"]
+                for word in words
+                if word["page"] == discharge_date_word["page"]
+                and discharge_date_word["top"] <= word["top"] < next_top
+                and 720 <= word["left"] < 770
+                and re.fullmatch(r"\d{2}:\d{2}(?::\d{2})?", word["text"])
+            ),
+            None,
+        )
+        name_words = sorted(
+            [
+                word
+                for word in words
+                if word["page"] == discharge_date_word["page"]
+                and 18 <= word["left"] < 139
+                and discharge_date_word["top"] - 1 <= word["top"] < next_top
+                and not re.fullmatch(r"[\d.]+", word["text"])
+                and word["text"] not in {"S", "PreOp", "PreOp-", "-"}
+                and not str(word["text"]).startswith("Total")
+            ],
+            key=lambda word: (word["top"], word["left"]),
+        )
+        name = " ".join(word["text"] for word in name_words).strip(" -")
+        if not name or not discharge_time:
+            continue
+        discharges.append(
+            Discharge(
+                name=name,
+                discharged_at=dt.datetime.strptime(
+                    f"{discharge_date_word['text']} {discharge_time[:5]}",
+                    "%d/%m/%Y %H:%M",
+                ),
+            )
+        )
     return discharges
 
 
