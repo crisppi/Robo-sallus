@@ -94,6 +94,11 @@ def main() -> int:
             "alta datada; altas ja confirmadas no destino sao preservadas."
         ),
     )
+    parser.add_argument(
+        "--sobrescrever-conflitos",
+        action="store_true",
+        help="Substitui evolucoes ja preenchidas no destino quando a origem estiver diferente.",
+    )
     args = parser.parse_args()
 
     source_workbook = load_workbook(args.origem, data_only=False)
@@ -139,6 +144,7 @@ def main() -> int:
     source_with_evolution = 0
     additions: list[tuple[int, int, tuple[str, str]]] = []
     conflicts: list[tuple[int, int, tuple[str, str]]] = []
+    overwrites: list[tuple[int, int, tuple[str, str]]] = []
     unmatched: list[tuple[int, tuple[str, str]]] = []
     matched_rows: list[tuple[int, int, tuple[str, str]]] = []
     seen_source_keys: set[tuple[str, str]] = set()
@@ -164,13 +170,19 @@ def main() -> int:
             additions.append((source_row, target_row, key))
         elif str(current).strip() != str(evolution).strip():
             conflicts.append((source_row, target_row, key))
+            if args.sobrescrever_conflitos:
+                overwrites.append((source_row, target_row, key))
 
     print(f"Evolucoes preenchidas na origem: {source_with_evolution}")
     print(f"Novas evolucoes a acrescentar: {len(additions)}")
     print(f"Conflitos preservados (destino ja preenchido): {len(conflicts)}")
+    if args.sobrescrever_conflitos:
+        print(f"Conflitos a sobrescrever: {len(overwrites)}")
     print(f"Pacientes da origem nao encontrados no destino: {len(unmatched)}")
     for source_row, target_row, key in additions:
         print(f"ADICIONAR {key[0]}={key[1]} origem_linha={source_row} destino_linha={target_row}")
+    for source_row, target_row, key in overwrites:
+        print(f"SOBRESCREVER {key[0]}={key[1]} origem_linha={source_row} destino_linha={target_row}")
 
     if not args.aplicar:
         print("Modo de conferencia: nenhum arquivo foi alterado.")
@@ -192,6 +204,18 @@ def main() -> int:
             source_value = source_sheet.cell(source_row, source_col).value
             target_value = target_sheet.cell(target_row, target_col).value
             if source_value not in (None, "") and target_value in (None, ""):
+                target_sheet.cell(target_row, target_col).value = source_value
+
+    for source_row, target_row, _key in overwrites:
+        target_sheet.cell(target_row, target_evolution_col).value = source_sheet.cell(
+            source_row, source_evolution_col
+        ).value
+        target_sheet.cell(target_row, target_evolution_col).fill = PatternFill(
+            "solid", fgColor="C6EFCE"
+        )
+        for source_col, target_col in metadata_pairs:
+            source_value = source_sheet.cell(source_row, source_col).value
+            if source_value not in (None, ""):
                 target_sheet.cell(target_row, target_col).value = source_value
 
     merged_discharges = 0
@@ -236,6 +260,7 @@ def main() -> int:
     target_workbook.save(args.destino)
     print(f"Arquivo atualizado: {args.destino}")
     print(f"Evolucoes acrescentadas: {len(additions)}")
+    print(f"Evolucoes sobrescritas: {len(overwrites)}")
     print(f"Altas datadas acrescentadas: {merged_discharges}")
     print(f"Altas datadas ja existentes e preservadas: {preserved_discharges}")
     print(f"Datas de evolucao preenchidas: {dated_rows}")
