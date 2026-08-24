@@ -931,6 +931,7 @@ def run_html_fill(
                 f"/avaliacao-internacao/{clinical_patient.id_internacao}"
                 f"/secao/{actual_section}"
             ),
+            timeout_seconds=75,
         )
 
     def open_sec(secao: str) -> None:
@@ -947,7 +948,7 @@ def run_html_fill(
         }
         section_title = section_titles.get(secao, "")
         last_error = ""
-        for navigation_attempt in range(5):
+        for navigation_attempt in range(2):
             actual_section = resolved_section_ids.get(secao, secao)
             try:
                 navigate_salus(
@@ -964,7 +965,7 @@ def run_html_fill(
             # Nunca aguarda uma navegação dentro da mesma Runtime.evaluate.
             # Quando o clique do stepper troca a rota Angular, o contexto JS
             # anterior é destruído e o CDP ficava preso por 120 segundos.
-            for readiness_attempt in range(72):
+            for readiness_attempt in range(12):
                 try:
                     ready = evaluate_js(
                         f"""
@@ -1006,7 +1007,7 @@ def run_html_fill(
                         """,
                         cdp_url=cdp_url,
                         url_contains=f"/avaliacao-internacao/{clinical_patient.id_internacao}/",
-                        timeout_seconds=45,
+                        timeout_seconds=8,
                     )
                 except SalusCdpError as exc:
                     last_error = str(exc)
