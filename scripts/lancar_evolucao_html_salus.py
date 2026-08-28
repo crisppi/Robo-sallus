@@ -931,7 +931,7 @@ def run_html_fill(
                 f"/avaliacao-internacao/{clinical_patient.id_internacao}"
                 f"/secao/{actual_section}"
             ),
-            timeout_seconds=75,
+            timeout_seconds=180,
         )
 
     def open_sec(secao: str) -> None:
@@ -1037,7 +1037,9 @@ def run_html_fill(
           const el = document.querySelector({json.dumps(selector)});
           if (!el) return `input nao encontrado: {selector}`;
           el.focus();
-          el.value = {json.dumps(val)};
+          const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+          if (setter) setter.call(el, {json.dumps(val)});
+          else el.value = {json.dumps(val)};
           for (const eventName of ['input', 'change', 'blur']) el.dispatchEvent(new Event(eventName, {{bubbles: true}}));
           return `input: {selector}`;
         }})()
@@ -1383,16 +1385,19 @@ def run_html_fill(
           const norm = (value) => String(value ?? '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toLowerCase();
           const compact = (value) => norm(value).replace(/[–—-]/g, ' ').replace(/[^a-z0-9]+/g, ' ').trim();
           const visible = (el) => {{
+            if (!el) return false;
             const rect = el.getBoundingClientRect();
             const style = getComputedStyle(el);
             return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
           }};
-          const labelOf = (el) => norm(el.closest('label')?.innerText || el.parentElement?.innerText || el.parentElement?.parentElement?.innerText || el.value);
+          const containerOf = (el) => el.closest('label') || el.parentElement || el.parentElement?.parentElement;
+          const labelOf = (el) => norm(containerOf(el)?.innerText || el.value);
+          const inputAvailable = (el) => !el.disabled && (visible(el) || visible(containerOf(el)));
           const wanted = norm({json.dumps(val)});
           const wantedCompact = compact({json.dumps(val)});
           const wantedValue = wanted === 'sim' ? 'sim' : (wanted === 'nao' ? 'nao' : wanted);
           const items = [...document.querySelectorAll(`input[name="${{CSS.escape({json.dumps(name)})}}"]`)]
-            .filter(visible);
+            .filter(inputAvailable);
           const el = items.find(input => {{
             const label = labelOf(input);
             const labelCompact = compact(label);
@@ -1412,7 +1417,11 @@ def run_html_fill(
           const byValue = items.find(input => norm(input.value) === wantedValue);
           const target = byValue || el;
           target.scrollIntoView({{block: 'center'}});
-          if (!target.checked) target.click();
+          if (!target.checked) {{
+            const clickable = target.closest('label') || target;
+            clickable.click();
+            if (!target.checked) target.click();
+          }}
           for (const eventName of ['input', 'change', 'blur']) target.dispatchEvent(new Event(eventName, {{bubbles: true}}));
           return `opcao: {name}`;
         }})()
@@ -1654,13 +1663,17 @@ def run_html_fill(
           }}
           if (!trigger) return `multiselect nao encontrado apos espera: {selector}`;
           const norm = (value) => String(value ?? '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toLowerCase();
-          let text = norm(trigger.innerText);
+          const isInputTrigger = trigger.matches('input, textarea');
+          const root = trigger.closest('app-multi-select-2, .multi-select-2, .multi-select') || trigger;
+          const field = trigger.closest('.multi-select-2__field, .multi-select__trigger') || trigger;
+          let text = norm(root.innerText || trigger.value || trigger.placeholder);
           const parts = {json.dumps([part.strip() for part in raw.split(";") if part.strip()], ensure_ascii=False)};
           let selectedCount = 0;
           const hasRealValue = (value) => value
             && !value.includes('busque')
             && !value.includes('selecione')
             && !value.includes('pesquisar')
+            && !/^(queixa|cid de internacao|cid ajustado|comorbidades)\s*\*?\s*[▾×x]?$/.test(value)
             && !/^0\s+selecionado/.test(value)
             && value !== '▾'
             && value !== 'x ▾'
@@ -1713,6 +1726,7 @@ def run_html_fill(
             return [...new Set(terms)];
           }};
           const isComplaint = {json.dumps(selector)} === '#admission-complaint';
+          const isCid = ['#admission-cid', '#admission-adjusted-cid'].includes({json.dumps(selector)});
           const isAdjustedCid = {json.dumps(selector)} === '#admission-adjusted-cid';
           const isTuss = {json.dumps(selector)}.includes('padrao-tiss-search-multi-select');
           const isSearchCatalog = ['#admission-complaint', '#admission-cid', '#admission-comorbidities', '#admission-adjusted-cid'].includes({json.dumps(selector)});
@@ -1730,22 +1744,22 @@ def run_html_fill(
             return Boolean(selected) && (selected === wanted || (wanted.includes('.') && selected === wanted.split('.')[0]));
           }};
           const desiredAlreadySelected = parts.every(part =>
-            isAdjustedCid && /^[a-z]\d/i.test(part.trim())
+            isCid && /^[a-z]\d/i.test(part.trim())
               ? cidSelectionMatches(part)
               : selectionNeedles(part).some(term => text.includes(norm(term)))
           );
           if (desiredAlreadySelected) {{
             return `multiselect ja preenchido: {selector}`;
           }}
-          if (isSearchCatalog && hasRealValue(text) && !isAdjustedCid) {{
+          if (isSearchCatalog && hasRealValue(text) && !isCid) {{
             return `multiselect ja possui valor real: {selector}`;
           }}
-          if (!isComplaint && text.includes('selecionado') && !isAdjustedCid) {{
+          if (!isComplaint && text.includes('selecionado') && !isCid) {{
             return `multiselect ja preenchido: {selector}`;
           }}
           if (isTuss && hasRealValue(text) && !desiredAlreadySelected) {{
-            const clear = trigger.querySelector('[aria-label*="Limpar"], [title*="Limpar"]')
-              || [...trigger.querySelectorAll('span, button')].find(el =>
+            const clear = root.querySelector('[aria-label*="Limpar"], [title*="Limpar"]')
+              || [...root.querySelectorAll('span, button')].find(el =>
                 norm(el.innerText) === 'x'
                 || norm(el.innerText) === '×'
                 || norm(el.getAttribute('aria-label') || el.getAttribute('title') || '').includes('limpar')
@@ -1754,21 +1768,21 @@ def run_html_fill(
               clear.dispatchEvent(new MouseEvent('mousedown', {{bubbles: true}}));
               clear.click();
               await sleep(700);
-              text = norm(trigger.innerText);
+              text = norm(root.innerText || trigger.value || trigger.placeholder);
             }}
           }}
-          if (isAdjustedCid && hasRealValue(text)) {{
-            const clear = trigger.querySelector('[aria-label*="Limpar"], [title*="Limpar"]')
-              || [...trigger.querySelectorAll('span, button')].find(el => norm(el.getAttribute('aria-label') || el.getAttribute('title') || '').includes('limpar'));
-            if (!clear) return `CID ajustado divergente e sem controle para limpar: ${{text}}`;
+          if (isCid && hasRealValue(text)) {{
+            const clear = root.querySelector('[aria-label*="Limpar"], [title*="Limpar"]')
+              || [...root.querySelectorAll('span, button')].find(el => norm(el.getAttribute('aria-label') || el.getAttribute('title') || '').includes('limpar'));
+            if (!clear) return `CID divergente e sem controle para limpar: ${{text}}`;
             clear.dispatchEvent(new MouseEvent('mousedown', {{bubbles: true}}));
             clear.click();
             await sleep(500);
-            text = norm(trigger.innerText);
+            text = norm(root.innerText || trigger.value || trigger.placeholder);
           }}
           if (isComplaint && text && !text.includes('busque') && !text.includes('selecione')) {{
-            const clear = trigger.querySelector('[aria-label*="Limpar"], [title*="Limpar"]')
-              || [...trigger.querySelectorAll('span, button')].find(el => norm(el.getAttribute('aria-label') || el.getAttribute('title') || '').includes('limpar'));
+            const clear = root.querySelector('[aria-label*="Limpar"], [title*="Limpar"]')
+              || [...root.querySelectorAll('span, button')].find(el => norm(el.getAttribute('aria-label') || el.getAttribute('title') || '').includes('limpar'));
             if (clear) {{
               clear.dispatchEvent(new MouseEvent('mousedown', {{bubbles: true}}));
               clear.click();
@@ -1782,30 +1796,55 @@ def run_html_fill(
             // caixa de pesquisa que tenha ficado aberta em outro componente.
             document.body.click();
             await sleep(250);
-            trigger.scrollIntoView({{block: 'center'}});
-            trigger.dispatchEvent(new MouseEvent('mousedown', {{bubbles: true}}));
-            trigger.click();
+            const opener = isInputTrigger ? trigger : field;
+            opener.scrollIntoView({{block: 'center'}});
+            opener.dispatchEvent(new MouseEvent('mousedown', {{bubbles: true}}));
+            opener.click();
             await sleep(400);
-            let search = null;
-            for (let i = 0; i < 10; i++) {{
-              search = [...document.querySelectorAll('input[type="text"]')]
-                .reverse().find(el => (norm(el.placeholder).includes('pesquisar') || String(el.id).includes('multi-select-search')) && el.offsetParent !== null);
-              if (search) break;
-              await sleep(300);
+            let search = isInputTrigger ? trigger : null;
+            if (!search) {{
+              for (let i = 0; i < 10; i++) {{
+                search = [...document.querySelectorAll('input[type="text"]')]
+                  .reverse().find(el => (
+                    norm(el.placeholder).includes('pesquisar')
+                    || norm(el.placeholder).includes('busque')
+                    || String(el.id).includes('multi-select-search')
+                    || String(el.className || '').includes('multi-select-2__input')
+                  ) && el.offsetParent !== null);
+                if (search) break;
+                await sleep(300);
+              }}
             }}
             let option = null;
             for (const term of searchTerms(part)) {{
               if (search) {{
                 search.focus();
-                search.value = term;
+                const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+                if (setter) setter.call(search, term);
+                else search.value = term;
                 search.dispatchEvent(new Event('input', {{bubbles: true}}));
                 search.dispatchEvent(new Event('change', {{bubbles: true}}));
                 await sleep(1500);
               }}
               for (let i = 0; i < 16; i++) {{
-                const optionCandidates = [
-                  ...document.querySelectorAll('button.multi-select__option, [role="option"], li')
+                const rawOptionCandidates = [
+                  ...document.querySelectorAll('button.multi-select__option, .multi-select-2__option, [class*="multi-select-2__option"], [role="option"], li')
                 ].filter(el => el.offsetParent !== null && !el.disabled && !String(el.className || '').includes('multi-select__trigger'));
+                const seenOptions = new Set();
+                const optionCandidates = [];
+                for (const rawCandidate of rawOptionCandidates) {{
+                  const candidate = rawCandidate.matches?.('.multi-select-2__option')
+                    ? rawCandidate
+                    : (
+                      rawCandidate.closest('.multi-select-2__option')
+                      || rawCandidate.querySelector?.('.multi-select-2__option')
+                      || rawCandidate
+                    );
+                  if (seenOptions.has(candidate) || !candidate.offsetParent) continue;
+                  seenOptions.add(candidate);
+                  if (norm(candidate.innerText).includes('selecionar todos')) continue;
+                  optionCandidates.push(candidate);
+                }}
                 for (const candidate of needles(part)) {{
                   option = optionCandidates.find(el => norm(el.innerText).includes(norm(candidate)));
                   if (option) break;
@@ -1857,7 +1896,8 @@ def run_html_fill(
           const norm = (value) => String(value ?? '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toLowerCase();
           const trigger = document.querySelector({json.dumps(selector)});
           if (!trigger) return false;
-          const text = norm(trigger.innerText);
+          const root = trigger.closest('app-multi-select-2, .multi-select-2, .multi-select') || trigger;
+          const text = norm(root.innerText || trigger.value || trigger.placeholder);
           if (!text || text.includes('busque') || text.includes('selecione')) return false;
           const parts = {json.dumps([part.strip() for part in raw.split(";") if part.strip()], ensure_ascii=False)};
           const needles = (part) => {{
@@ -1895,11 +1935,13 @@ def run_html_fill(
           const norm = (value) => String(value ?? '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toLowerCase();
           const trigger = document.querySelector({json.dumps(selector)});
           if (!trigger) return false;
-          const text = norm(trigger.innerText);
+          const root = trigger.closest('app-multi-select-2, .multi-select-2, .multi-select') || trigger;
+          const text = norm(root.innerText || trigger.value || trigger.placeholder);
           return Boolean(text)
             && !text.includes('busque')
             && !text.includes('selecione')
             && !text.includes('pesquisar')
+            && !/^(queixa|cid de internacao|cid ajustado|comorbidades)\s*\*?\s*[▾×x]?$/.test(text)
             && text !== '▾'
             && text !== 'x ▾'
             && text !== '× ▾';
@@ -1924,13 +1966,20 @@ def run_html_fill(
     def choose_required_multi(secao: str, selector: str, raw: str, label: str) -> None:
         if not raw:
             raise RuntimeError(f"{label}: valor obrigatório vazio antes do preenchimento.")
-        if multi_has_any_value(secao, selector):
+        is_cid_selector = selector in {"#admission-cid", "#admission-adjusted-cid"}
+        is_complaint_selector = selector == "#admission-complaint"
+        if multi_has_value(secao, selector, raw):
+            all_logs.append(f"{label}: ja possuia valor esperado no HTML")
+            return
+        if not is_cid_selector and not is_complaint_selector and multi_has_any_value(secao, selector):
             all_logs.append(f"{label}: ja possuia valor no HTML")
             return
         for attempt in range(3):
             choose_multi(secao, selector, raw)
             time.sleep(1.0)
-            if multi_has_any_value(secao, selector) or multi_has_value(secao, selector, raw):
+            if multi_has_value(secao, selector, raw) or (
+                not is_cid_selector and multi_has_any_value(secao, selector)
+            ):
                 all_logs.append(f"{label}: confirmado no HTML")
                 return
             all_logs.append(f"{label}: tentativa {attempt + 1} nao persistiu")
@@ -1961,34 +2010,66 @@ def run_html_fill(
             return eval_sec(
                 secao,
                 f"""
-                (async () => {{
-                  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-                  const trigger = document.querySelector('#admission-comorbidities');
-                  if (!trigger) return {{ok:false, error:'campo não encontrado'}};
-                  if (String(trigger.innerText).includes({json.dumps(code)})) return {{ok:true, already:true}};
-                  let search = [...document.querySelectorAll('input[type="text"]')]
-                    .reverse().find(el => el.placeholder === 'Pesquisar' && el.offsetParent !== null);
-                  if (!search) {{
-                    trigger.scrollIntoView({{block:'center'}});
-                    for (let attempt = 0; attempt < 3 && !search; attempt++) {{
-                      trigger.dispatchEvent(new MouseEvent('mousedown', {{bubbles:true}}));
-                      trigger.click();
-                      await sleep(700);
-                      search = [...document.querySelectorAll('input[type="text"]')]
-                        .reverse().find(el => el.placeholder === 'Pesquisar' && el.offsetParent !== null);
-                    }}
-                  }}
-                  if (!search) return {{ok:false, error:'pesquisa não abriu'}};
-                  search.value = {json.dumps(code)};
-                  search.dispatchEvent(new Event('input', {{bubbles:true}}));
-                  await sleep(2200);
-                  const option = [...document.querySelectorAll('button.multi-select__option')]
-                    .find(el => String(el.innerText || '').trim().startsWith({json.dumps(code + ' -')}));
-                  if (!option) return {{ok:false, error:'opção não encontrada'}};
-                  option.click();
-                  await sleep(700);
-                  return {{ok:String(trigger.innerText).includes({json.dumps(code)}), value:trigger.innerText}};
-                }})()
+	                (async () => {{
+	                  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+	                  const norm = value => String(value || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/\\s+/g, ' ').trim().toLowerCase();
+	                  const trigger = document.querySelector('#admission-comorbidities');
+	                  if (!trigger) return {{ok:false, error:'campo não encontrado'}};
+	                  const root = trigger.closest('app-multi-select-2, .multi-select-2, .multi-select') || trigger;
+	                  const selectedText = () => String(root.innerText || trigger.value || '');
+	                  if (selectedText().includes({json.dumps(code)})) return {{ok:true, already:true}};
+	                  let search = trigger.matches('input, textarea') ? trigger : null;
+	                  if (!search) {{
+	                    const opener = trigger.closest('.multi-select-2__field, .multi-select__trigger') || trigger;
+	                    opener.scrollIntoView({{block:'center'}});
+	                    for (let attempt = 0; attempt < 3 && !search; attempt++) {{
+	                      opener.dispatchEvent(new MouseEvent('mousedown', {{bubbles:true}}));
+	                      opener.click();
+	                      await sleep(700);
+	                      search = [...document.querySelectorAll('input[type="text"]')]
+	                        .reverse().find(el => (
+	                          norm(el.placeholder).includes('pesquisar')
+	                          || norm(el.placeholder).includes('buscar')
+	                          || norm(el.placeholder).includes('busque')
+	                          || String(el.className || '').includes('multi-select-2__input')
+	                        ) && el.offsetParent !== null);
+	                    }}
+	                  }}
+	                  if (!search) return {{ok:false, error:'pesquisa não abriu'}};
+	                  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+	                  if (setter) setter.call(search, {json.dumps(code)});
+	                  else search.value = {json.dumps(code)};
+	                  search.dispatchEvent(new Event('input', {{bubbles:true}}));
+	                  search.dispatchEvent(new Event('change', {{bubbles:true}}));
+	                  await sleep(2200);
+	                  const rawOptions = [...document.querySelectorAll('button.multi-select__option, .multi-select-2__option, [class*="multi-select-2__option"], [role="option"], li')]
+	                    .filter(el => el.offsetParent !== null && !el.disabled);
+	                  const seenOptions = new Set();
+	                  const options = [];
+	                  for (const rawOption of rawOptions) {{
+	                    const option = rawOption.matches?.('.multi-select-2__option')
+	                      ? rawOption
+	                      : (
+	                        rawOption.closest('.multi-select-2__option')
+	                        || rawOption.querySelector?.('.multi-select-2__option')
+	                        || rawOption
+	                      );
+	                    if (seenOptions.has(option) || !option.offsetParent) continue;
+	                    seenOptions.add(option);
+	                    if (norm(option.innerText).includes('selecionar todos')) continue;
+	                    options.push(option);
+	                  }}
+	                  const option = options.find(el => String(el.innerText || '').trim().startsWith({json.dumps(code + ' -')}))
+	                    || options.find(el => norm(el.innerText).startsWith(norm({json.dumps(code)})));
+	                  if (!option) return {{ok:false, error:'opção não encontrada'}};
+	                  option.dispatchEvent(new PointerEvent('pointerdown', {{bubbles:true}}));
+	                  option.dispatchEvent(new MouseEvent('mousedown', {{bubbles:true}}));
+	                  option.dispatchEvent(new PointerEvent('pointerup', {{bubbles:true}}));
+	                  option.dispatchEvent(new MouseEvent('mouseup', {{bubbles:true}}));
+	                  option.click();
+	                  await sleep(700);
+	                  return {{ok:selectedText().includes({json.dumps(code)}), value:selectedText()}};
+	                }})()
                 """,
             )
 
@@ -2022,10 +2103,11 @@ def run_html_fill(
             secao,
             f"""
             (async () => {{
-              const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-              const trigger = document.querySelector('#admission-comorbidities');
-              document.body.dispatchEvent(new MouseEvent('mousedown', {{bubbles:true}}));
-              document.body.click();
+	              const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+	              const trigger = document.querySelector('#admission-comorbidities');
+	              const root = trigger?.closest('app-multi-select-2, .multi-select-2, .multi-select') || trigger;
+	              document.body.dispatchEvent(new MouseEvent('mousedown', {{bubbles:true}}));
+	              document.body.click();
               await sleep(300);
               const openPanel = [...document.querySelectorAll('.cdk-overlay-pane')]
                 .find(panel => panel.offsetParent !== null);
@@ -2033,10 +2115,10 @@ def run_html_fill(
                 trigger?.click();
                 await sleep(300);
               }}
-              const codes = {json.dumps(selected_codes, ensure_ascii=False)};
-              return Boolean(trigger)
-                && codes.every(code => String(trigger.innerText || '').includes(code))
-                && ![...document.querySelectorAll('.cdk-overlay-pane')].some(panel => panel.offsetParent !== null);
+	              const codes = {json.dumps(selected_codes, ensure_ascii=False)};
+	              return Boolean(trigger)
+	                && codes.every(code => String(root?.innerText || trigger.value || '').includes(code))
+	                && ![...document.querySelectorAll('.cdk-overlay-pane')].some(panel => panel.offsetParent !== null);
             }})()
             """,
         )
@@ -2070,6 +2152,7 @@ def run_html_fill(
             "200007": "Dados Cirúrgicos",
         }
         title = section_titles.get(secao, "")
+        actual_section = resolved_section_ids.get(secao, secao)
         if not clicked_next:
             if allow_incomplete:
                 print(f"HTML: secao {secao} mantida incompleta", flush=True)
@@ -2120,6 +2203,24 @@ def run_html_fill(
             time.sleep(0.8)
         completed = stable_completed_reads >= 2
         if not completed and not allow_incomplete:
+            try:
+                current_url = str(
+                    evaluate_js(
+                        "location.href",
+                        cdp_url=cdp_url,
+                        url_contains=f"/avaliacao-internacao/{clinical_patient.id_internacao}/",
+                        timeout_seconds=10,
+                    )
+                    or ""
+                )
+            except SalusCdpError:
+                current_url = ""
+            if f"/secao/{actual_section}" not in current_url:
+                all_logs.append(
+                    f"{title}: rota avançou sem check verde persistente ({current_url}); seguindo."
+                )
+                print(f"HTML: secao {secao} avancou pela rota", flush=True)
+                return
             diagnostics = current_page_diagnostics(secao)
             if secao == "100003" and "acquired-condition-yn" in diagnostics:
                 all_logs.append(
@@ -2269,10 +2370,11 @@ def run_html_fill(
         value_or("Dados da Internação - Paciente em isolamento? *", "Não"),
     )
     click_checkbox_label("100001", value("Dados da Internação - Motivo do isolamento * (cond.)"))
-    choose_multi(
+    choose_required_multi(
         "100001",
         "#admission-complaint",
         value("Dados da Internação - Queixa *") or value("evolucao"),
+        "Queixa",
     )
     admission_cid_value = value("Dados da Internação - CID de internação *")
     adjusted_cid_from_salus = ""
@@ -2293,7 +2395,7 @@ def run_html_fill(
         admission_cid_value = infer_cid_from_evolution(value("evolucao"))
     missing_cid = not admission_cid_value
     if admission_cid_value:
-        choose_multi("100001", "#admission-cid", admission_cid_value)
+        choose_required_multi("100001", "#admission-cid", admission_cid_value, "CID de internação")
     adjusted_cid_value = value("Dados da Internação - CID ajustado *") or adjusted_cid_from_salus or admission_cid_value
     choose_comorbidities("100001", value("Dados da Internação - Comorbidades *"))
     if adjusted_cid_value:
