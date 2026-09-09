@@ -2004,6 +2004,23 @@ def run_html_fill(
             # exibem este campo. Campo ausente no próprio formulário não é erro.
             all_logs.append("Comorbidades: campo não oferecido neste fluxo; ignorado")
             return
+        current_summary = str(
+            eval_sec(
+                secao,
+                """
+                (() => {
+                  const trigger = document.querySelector('#admission-comorbidities');
+                  const root = trigger?.closest('app-multi-select-2, .multi-select-2, .multi-select') || trigger;
+                  document.body.click();
+                  return String(root?.innerText || trigger?.value || '').replace(/\\s+/g, ' ').trim();
+                })()
+                """,
+            )
+            or ""
+        )
+        if re.search(r"\b\d+\s+itens?\s+selecionados?\b", current_summary, re.I):
+            all_logs.append(f"Comorbidades: mantendo seleção existente ({current_summary})")
+            return
         items = [item.strip() for item in raw.split(";") if item.strip()]
 
         def select_code(code: str) -> Any:
@@ -2168,6 +2185,21 @@ def run_html_fill(
         stable_completed_reads = 0
         for _ in range(90):
             try:
+                current_url = str(
+                    evaluate_js(
+                        "location.href",
+                        cdp_url=cdp_url,
+                        url_contains=f"/avaliacao-internacao/{clinical_patient.id_internacao}/",
+                        timeout_seconds=10,
+                    )
+                    or ""
+                )
+                if f"/secao/{actual_section}" not in current_url:
+                    all_logs.append(
+                        f"{title}: rota avançou sem esperar check verde ({current_url}); seguindo."
+                    )
+                    print(f"HTML: secao {secao} avancou pela rota", flush=True)
+                    return
                 step_state = evaluate_js(
                         f"""
                         (() => {{

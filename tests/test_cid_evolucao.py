@@ -57,6 +57,31 @@ class CidEvolutionTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(infer_cid_from_evolution(text), expected)
 
+    def test_ignores_historical_covid_when_current_problem_is_digestive(self):
+        text = (
+            "Paciente interna por cansaço de início recente e alteração hábito intestinal. "
+            "Antecedentes: HAS; COVID-19 agosto 2020."
+        )
+        self.assertEqual(infer_cid_from_evolution(text), "R19.4")
+
+    def test_rectal_neoplasm_beats_hemorrhoid_history(self):
+        text = (
+            "CEC p16+ em lesão retal distal localmente avançada. "
+            "Antecedentes: Doença Hemorroidária."
+        )
+        self.assertEqual(infer_cid_from_evolution(text), "C20")
+
+    def test_daily_missing_cid_patterns(self):
+        cases = {
+            "diagnóstico de abscesso de face odontogênico": "K04.7",
+            "historia de amigdalite aguda evoluindo com abscesso periamigdaliano": "J36",
+            "TC sugere colite estercoral": "K52",
+            "Internada por constipação crônica": "K59",
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(infer_cid_from_evolution(text), expected)
+
 
 if __name__ == "__main__":
     unittest.main()
